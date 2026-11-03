@@ -1,7 +1,14 @@
 <script lang="ts">
   import * as L from "leaflet";
   import "leaflet/dist/leaflet.css";
-  import { onDestroy, onMount } from "svelte";
+  import { leafletRasterLayer, TileType } from "pmtiles";
+  import { leafletLayer as protomapsLeafletLayer } from "protomaps-leaflet";
+  import { onMount } from "svelte";
+  import {
+    loadSavedOfflineMap,
+    offlineMap,
+    type OfflineMapPackage,
+  } from "$lib/services/offline-maps";
   // Import pin service instead of store
   import {
     type Pin,
@@ -26,6 +33,10 @@
 
   let mapContainer: HTMLDivElement;
   let map: LeafletMap;
+  let onlineBaseLayer: L.TileLayer;
+  let offlineBaseLayer: L.Layer | null = null;
+  let baseLayerControl: L.Control.Layers;
+  let unsubscribeOfflineMap: (() => void) | null = null;
   let currentPosition = $state({ lat: 35.6895, lng: 51.389 });
   let coordinates = $state("0, 0");
 
@@ -33,7 +44,6 @@
   let backendPins = $state<Pin[]>([]);
 
   // Map layers state
-  let baseLayer = $state(true);
   let routesLayer = $state(false);
   let objectsLayer = $state(true);
 
@@ -72,8 +82,85 @@
   }
   let pinFrames = $state<PinFrame[]>([]);
 
+  function escapeHtml(value: string): string {
+    return value.replace(/[&<>"']/g, (character) => {
+      const replacements: Record<string, string> = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      };
+      return replacements[character] ?? character;
+    });
+  }
+
+  function syncOfflineBaseLayer(archive: OfflineMapPackage | null): void {
+    if (!map || !onlineBaseLayer || !baseLayerControl) return;
+
+    if (offlineBaseLayer) {
+      if (map.hasLayer(offlineBaseLayer)) map.removeLayer(offlineBaseLayer);
+      baseLayerControl.removeLayer(offlineBaseLayer);
+      offlineBaseLayer = null;
+    }
+
+    if (!archive) {
+      if (!map.hasLayer(onlineBaseLayer)) onlineBaseLayer.addTo(map);
+      return;
+    }
+
+    const attribution = escapeHtml(archive.info.attribution);
+    const bounds = L.latLngBounds(
+      [archive.header.minLat, archive.header.minLon],
+      [archive.header.maxLat, archive.header.maxLon],
+    );
+    const tileOptions = {
+      attribution,
+      minZoom: archive.header.minZoom,
+      maxZoom: archive.header.maxZoom,
+      bounds: bounds.isValid() ? bounds : undefined,
+      noWrap: true,
+    };
+
+    let layer: L.Layer;
+    if (archive.header.tileType === TileType.Mvt) {
+      layer = protomapsLeafletLayer({
+        ...tileOptions,
+        url: archive.pmtiles,
+        flavor: "light",
+        lang: "fa",
+        maxDataZoom: archive.header.maxZoom,
+      }) as unknown as L.Layer;
+    } else {
+      layer = leafletRasterLayer(archive.pmtiles, tileOptions) as L.Layer;
+      layer.on("tileunload", (event: L.TileEvent) => {
+        const sourceUrl = event.tile.currentSrc || event.tile.src;
+        if (sourceUrl.startsWith("blob:")) URL.revokeObjectURL(sourceUrl);
+      });
+    }
+
+    const layerName = `نقشه آفلاین · ${escapeHtml(archive.info.name)}`;
+    baseLayerControl.addBaseLayer(layer, layerName);
+
+    if (map.hasLayer(onlineBaseLayer)) map.removeLayer(onlineBaseLayer);
+    layer.addTo(map);
+    offlineBaseLayer = layer;
+
+    if (bounds.isValid()) {
+      map.fitBounds(bounds, {
+        padding: [24, 24],
+        maxZoom: Math.min(13, archive.header.maxZoom),
+      });
+    }
+  }
+
   // Initialize the map when the component mounts
   onMount(() => {
+    let isDisposed = false;
+
+    // Leaflet-based PMTiles adapters expect the Leaflet namespace on the global object.
+    (globalThis as typeof globalThis & { L?: typeof L }).L = L;
+
     // Fix for default marker icons in Leaflet with Vite
     // @ts-ignore: _getIconUrl property exists but is not typed
     delete L.Icon.Default.prototype._getIconUrl;
@@ -89,12 +176,36 @@
       13,
     );
 
-    // Add OpenStreetMap tile layer
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution:
-        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-      maxZoom: 19,
-    }).addTo(map);
+    // Keep the existing online OSM layer as an explicit option; it is never used
+    // to prefetch tiles for offline coverage.
+    onlineBaseLayer = L.tileLayer(
+      "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+      {
+        attribution:
+          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19,
+      },
+    );
+    baseLayerControl = L.control
+      .layers(
+        { "نقشه آنلاین (OpenStreetMap)": onlineBaseLayer },
+        undefined,
+        { collapsed: true, position: "topleft" },
+      )
+      .addTo(map);
+
+    const subscribeToOfflineMap = () => {
+      if (isDisposed || !map) return;
+      unsubscribeOfflineMap = offlineMap.subscribe(syncOfflineBaseLayer);
+    };
+    void loadSavedOfflineMap()
+      .then(subscribeToOfflineMap)
+      .catch((error) => {
+        console.error("Error loading offline map package:", error);
+        // If local storage is unavailable or the saved pack is invalid, keep
+        // the online map usable instead of leaving the basemap empty.
+        subscribeToOfflineMap();
+      });
 
     // Load pins from backend
     loadPins()
@@ -198,6 +309,9 @@
 
     // Cleanup function
     return () => {
+      isDisposed = true;
+      unsubscribeOfflineMap?.();
+      unsubscribeOfflineMap = null;
       document.removeEventListener("click", handleOutsideClick);
       if (map) {
         map.remove();

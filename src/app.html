@@ -8,67 +8,9 @@
         <meta name="theme-color" content="#eff6ff" />
         <meta name="description" content="AFRA Ground Station — robot control and telemetry." />
         <title>AFRA Ground Station</title>
-        <style>
-            #app-bootstrap-splash {
-                position: fixed;
-                z-index: 2147483647;
-                inset: 0;
-                display: grid;
-                place-items: center;
-                overflow: hidden;
-                color: #102b5b;
-                background: radial-gradient(ellipse at 50% 42%, #fff 0%, #f7fbff 43%, #e7f2ff 100%);
-                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            }
-            #app-bootstrap-splash .content {
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                padding: 2rem 1.25rem;
-                text-align: center;
-            }
-            #app-bootstrap-splash img {
-                display: block;
-                width: clamp(160px, 32vh, 224px);
-                aspect-ratio: 1;
-                border: 1px solid rgba(34, 93, 165, 0.08);
-                border-radius: 26px;
-                background: #fff;
-                box-shadow: 0 24px 64px rgba(25, 70, 132, 0.14);
-                object-fit: contain;
-            }
-            #app-bootstrap-splash h1 {
-                display: flex;
-                flex-wrap: wrap;
-                justify-content: center;
-                gap: 0.5rem;
-                margin: 1.5rem 0 0;
-                font-size: clamp(1.4rem, 4vw, 1.95rem);
-                font-weight: 700;
-                letter-spacing: -0.045em;
-                line-height: 1.2;
-            }
-            #app-bootstrap-splash h1 span { color: #3973bd; font-weight: 500; }
-            #app-bootstrap-splash .tagline { margin: 0.65rem 0 0; color: #657995; font-size: 0.95rem; }
-            #app-bootstrap-splash .status { margin: 2rem 0 0; color: #72839a; font-size: 0.8rem; }
-            @media (max-height: 520px) {
-                #app-bootstrap-splash img { width: clamp(112px, 23vh, 152px); border-radius: 20px; }
-                #app-bootstrap-splash .content { padding-block: 1rem; }
-                #app-bootstrap-splash h1 { margin-top: 1rem; }
-                #app-bootstrap-splash .status { margin-top: 1.25rem; }
-            }
-        </style>
         %sveltekit.head%
     </head>
     <body data-sveltekit-preload-data="hover">
-        <div id="app-bootstrap-splash" role="status" aria-live="polite" aria-label="Loading AFRA Ground Station">
-            <div class="content">
-                <img src="%sveltekit.assets%/logo.jpg" alt="AFRA logo" />
-                <h1>AFRA <span>Ground Station</span></h1>
-                <p class="tagline" dir="rtl">سامانه کنترل و پایش ربات</p>
-                <p class="status" dir="rtl">در حال آماده‌سازی ایستگاه زمینی…</p>
-            </div>
-        </div>
         <div style="display: contents">%sveltekit.body%</div>
     </body>
 </html>

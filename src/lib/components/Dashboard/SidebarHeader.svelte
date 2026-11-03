@@ -1,6 +1,5 @@
 <script lang="ts">
-    import Icon from "$lib/components/Icon.svelte";
-    import { ChevronRight, Menu, X } from "lucide-svelte";
+    import { ChevronRight, Menu } from "lucide-svelte";
     import { navigationStore } from "$lib/stores/navigation";
 
     interface Props {
@@ -31,7 +30,14 @@
                 class:opacity-100={!sidebarTransitioning ||
                     !$navigationStore.sidebarCollapsed}
             >
-                <img src="/icon.png" alt="AFRA" class="h-8 w-8 rounded-lg object-cover" />
+                <img
+                    src="/icon.png"
+                    alt="AFRA logo"
+                    width="512"
+                    height="512"
+                    decoding="async"
+                    class="h-10 w-10 rounded-lg object-contain"
+                />
                 <div
                     class="flex flex-col leading-tight transition-opacity duration-300"
                     class:opacity-0={sidebarTransitioning &&

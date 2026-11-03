@@ -1,7 +1,22 @@
-# Tauri + SvelteKit + TypeScript
+# AFRA Ground Station
 
-This template should help get you started developing with Tauri, SvelteKit and TypeScript in Vite.
+AFRA Ground Station is a desktop control and telemetry application for AFRA robotics, built with Tauri 2, SvelteKit, TypeScript, and Rust.
 
-## Recommended IDE Setup
+## Development
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+```bash
+pnpm install
+pnpm tauri dev
+```
+
+Run the frontend type and Svelte checks with:
+
+```bash
+pnpm check
+```
+
+Create a desktop build with:
+
+```bash
+pnpm tauri build
+```

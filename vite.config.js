@@ -28,6 +28,8 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
+    // Permit the host used by Arena's proxied live preview.
+    allowedHosts: [".e2b.app"],
     hmr: host
       ? {
           protocol: "ws",

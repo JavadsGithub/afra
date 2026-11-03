@@ -60,9 +60,12 @@
         <div class="card-body">
             <div class="flex flex-col items-center">
                 <img
-                    src="/logo.jpg"
+                    src="/afra-logo.png"
                     alt="AFRA logo"
-                    class="h-24 w-24 rounded-2xl object-contain shadow-sm"
+                    width="1024"
+                    height="1024"
+                    decoding="async"
+                    class="h-32 w-32 rounded-2xl object-contain shadow-sm"
                 />
                 <p class="mt-2 text-xs font-semibold uppercase tracking-[0.16em] text-primary">
                     AFRA Ground Station

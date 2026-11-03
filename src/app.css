@@ -1,0 +1,151 @@
+@import "tailwindcss";
+@plugin "daisyui";
+
+@plugin "daisyui/theme" {
+  name: "remote-control";
+  default: true;
+  prefersdark: false;
+  color-scheme: light;
+
+  /* Base – warm off-white with a subtle cream undertone */
+  --color-base-100: oklch(98.5% 0.008 85);
+  --color-base-200: oklch(95% 0.015 85);
+  --color-base-300: oklch(91% 0.02 85);
+  --color-base-content: oklch(15% 0.015 85);
+
+  /* Primary – modern indigo-blue */
+  --color-primary: oklch(62% 0.22 265);
+  --color-primary-content: oklch(98% 0.005 85);
+
+  /* Secondary – teal */
+  --color-secondary: oklch(70% 0.18 195);
+  --color-secondary-content: oklch(98% 0.005 85);
+
+  /* Accent – coral/rose */
+  --color-accent: oklch(72% 0.22 25);
+  --color-accent-content: oklch(98% 0.005 85);
+
+  /* Neutral – slate */
+  --color-neutral: oklch(45% 0.04 260);
+  --color-neutral-content: oklch(98% 0.005 85);
+
+  /* Semantic colors */
+  --color-info: oklch(68% 0.18 235);
+  --color-info-content: oklch(98% 0.005 85);
+
+  --color-success: oklch(68% 0.18 155);
+  --color-success-content: oklch(98% 0.005 85);
+
+  --color-warning: oklch(82% 0.18 85);
+  --color-warning-content: oklch(15% 0.02 85);
+
+  --color-error: oklch(62% 0.26 25);
+  --color-error-content: oklch(98% 0.005 85);
+
+  /* UI radii – slightly softer */
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+
+  /* Sizes & borders */
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+
+  /* Effects */
+  --depth: 1;
+  --noise: 0;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-Thin.woff2") format("woff2");
+  font-weight: 100;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-ExtraLight.woff2") format("woff2");
+  font-weight: 200;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-ExtraBold.woff2") format("woff2");
+  font-weight: 800;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/Vazirmatn-Black.woff2") format("woff2");
+  font-weight: 900;
+  font-display: swap;
+}
+
+/* Optional: Variable font (if you want to use the single variable file instead) */
+/*
+@font-face {
+  font-family: 'Vazirmatn';
+  src: url('/fonts/Vazirmatn[wght].woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-display: swap;
+}
+*/
+
+html,
+body {
+  font-family: Vazirmatn;
+  /* Disable text selection by default */
+  -webkit-user-select: none; /* Safari */
+  -ms-user-select: none; /* IE 10 and IE 11 */
+  user-select: none; /* Standard syntax */
+}
+
+/* Allow text selection where needed */
+input,
+textarea,
+pre,
+code,
+[contenteditable] {
+  -webkit-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+}

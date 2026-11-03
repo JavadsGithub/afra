@@ -1,0 +1,5 @@
+I need you to make the functionality for recieving and logging data.
+let me tell you how:
+
+we have a mocking app for sending data. in this mocker project we have put all types of data that this current(draft) project will recieve and log in log functionality that we have in UI.
+your job is to make logger functionality work according to mocker data.

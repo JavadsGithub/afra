@@ -2,7 +2,7 @@
 @plugin "daisyui";
 
 @plugin "daisyui/theme" {
-  name: "remote-control";
+  name: "afra-ground-station";
   default: true;
   prefersdark: false;
   color-scheme: light;

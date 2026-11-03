@@ -58,6 +58,16 @@
 <div class="flex min-h-screen items-center justify-center bg-base-200">
     <div class="card w-96 bg-base-100 shadow-xl">
         <div class="card-body">
+            <div class="flex flex-col items-center">
+                <img
+                    src="/logo.jpg"
+                    alt="AFRA logo"
+                    class="h-24 w-24 rounded-2xl object-contain shadow-sm"
+                />
+                <p class="mt-2 text-xs font-semibold uppercase tracking-[0.16em] text-primary">
+                    AFRA Ground Station
+                </p>
+            </div>
             <h2 class="card-title justify-center text-2xl">
                 {#if hasPassword}
                     ورود به سیستم
@@ -73,11 +83,12 @@
             {:else}
                 <form on:submit|preventDefault={handleSubmit}>
                     <div class="form-control">
-                        <label class="label">
+                        <label class="label" for="password">
                             <span class="label-text">رمز عبور</span>
                         </label>
                         <div class="relative">
                             <input
+                                id="password"
                                 type={showPassword ? "text" : "password"}
                                 bind:value={password}
                                 placeholder="رمز عبور را وارد کنید"
@@ -100,10 +111,11 @@
 
                     {#if !hasPassword}
                         <div class="form-control mt-4">
-                            <label class="label">
+                            <label class="label" for="confirm-password">
                                 <span class="label-text">تکرار رمز عبور</span>
                             </label>
                             <input
+                                id="confirm-password"
                                 type={showPassword ? "text" : "password"}
                                 bind:value={confirmPassword}
                                 placeholder="رمز عبور را مجدداً وارد کنید"

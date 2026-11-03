@@ -1,7 +1,7 @@
 [package]
-name = "remote-control"
+name = "afra-ground-station"
 version = "0.1.0"
-description = "A Waypoint based remote control application"
+description = "AFRA Ground Station desktop application"
 authors = ["you"]
 edition = "2021"
 

@@ -31,16 +31,17 @@
                 class:opacity-100={!sidebarTransitioning ||
                     !$navigationStore.sidebarCollapsed}
             >
-                <img src="/icon.png" alt="icon" class="h-8 w-8 rounded-lg" />
-                <span
-                    class="text-xl font-bold transition-opacity duration-300"
+                <img src="/icon.png" alt="AFRA" class="h-8 w-8 rounded-lg object-cover" />
+                <div
+                    class="flex flex-col leading-tight transition-opacity duration-300"
                     class:opacity-0={sidebarTransitioning &&
                         $navigationStore.sidebarCollapsed}
                     class:opacity-100={!sidebarTransitioning ||
                         !$navigationStore.sidebarCollapsed}
                 >
-                    داشبورد
-                </span>
+                    <span class="text-sm font-bold tracking-wide">AFRA</span>
+                    <span class="text-[10px] font-medium text-base-content/60">Ground Station</span>
+                </div>
             </div>
             <button class="btn btn-ghost btn-square" onclick={toggleSidebar}>
                 <ChevronRight class="h-5 w-5" />

@@ -5,9 +5,11 @@
   import { leafletLayer as protomapsLeafletLayer } from "protomaps-leaflet";
   import { onMount } from "svelte";
   import {
-    loadSavedOfflineMap,
+    loadOfflineTile,
+    loadSavedOfflineMaps,
     offlineMap,
     type OfflineMapPackage,
+    type XyzOfflineMap,
   } from "$lib/services/offline-maps";
   // Import pin service instead of store
   import {
@@ -30,13 +32,19 @@
   import { get } from "svelte/store";
 
   type LeafletMap = L.Map;
+  type OfflineTileElement = HTMLImageElement & {
+    _offlineAbort?: AbortController;
+    _offlineObjectUrl?: string;
+    _offlineDone?: boolean;
+  };
 
   let mapContainer: HTMLDivElement;
   let map: LeafletMap;
   let onlineBaseLayer: L.TileLayer;
   let offlineBaseLayer: L.Layer | null = null;
-  let baseLayerControl: L.Control.Layers;
   let unsubscribeOfflineMap: (() => void) | null = null;
+  let baseMapMode = $state<"online" | "offline">("online");
+  let hasOfflineMap = $state(false);
   let currentPosition = $state({ lat: 35.6895, lng: 51.389 });
   let coordinates = $state("0, 0");
 
@@ -95,61 +103,146 @@
     });
   }
 
-  function syncOfflineBaseLayer(archive: OfflineMapPackage | null): void {
-    if (!map || !onlineBaseLayer || !baseLayerControl) return;
+  function createXyzOfflineLayer(packageInfo: XyzOfflineMap, bounds: L.LatLngBounds): L.Layer {
+    const createTile = (coords: L.Coords, done: L.DoneCallback): HTMLElement => {
+      const tile = document.createElement("img") as OfflineTileElement;
+      const controller = new AbortController();
+      tile._offlineAbort = controller;
+      tile.alt = "";
+      tile.setAttribute("role", "presentation");
+      tile.decoding = "async";
+
+      const finish = (error?: Error) => {
+        if (tile._offlineDone) return;
+        tile._offlineDone = true;
+        done(error, tile);
+      };
+      const cleanup = () => {
+        tile.onload = null;
+        tile.onerror = null;
+        if (tile._offlineObjectUrl) {
+          URL.revokeObjectURL(tile._offlineObjectUrl);
+          tile._offlineObjectUrl = undefined;
+        }
+      };
+
+      void loadOfflineTile(packageInfo.info.id, coords.z, coords.x, coords.y)
+        .then((blob) => {
+          if (controller.signal.aborted) return;
+          if (!blob) {
+            finish();
+            return;
+          }
+
+          tile._offlineObjectUrl = URL.createObjectURL(blob);
+          tile.onload = () => finish();
+          tile.onerror = () => {
+            cleanup();
+            finish(new Error("آماده‌سازی کاشی آفلاین ناموفق بود"));
+          };
+          tile.src = tile._offlineObjectUrl;
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) {
+            finish(error instanceof Error ? error : new Error("خواندن کاشی آفلاین ناموفق بود"));
+          }
+        });
+
+      return tile;
+    };
+
+    const OfflineGridLayer = L.GridLayer.extend({ createTile }) as unknown as new (
+      options: L.GridLayerOptions,
+    ) => L.GridLayer;
+    const layer = new OfflineGridLayer({
+      attribution: escapeHtml(packageInfo.info.attribution),
+      minZoom: packageInfo.info.minZoom,
+      maxZoom: packageInfo.info.maxZoom,
+      bounds: bounds.isValid() ? bounds : undefined,
+      tileSize: 256,
+      noWrap: true,
+    }) as L.GridLayer;
+
+    layer.on("tileunload", (event: L.TileEvent) => {
+      const tile = event.tile as OfflineTileElement;
+      tile._offlineAbort?.abort();
+      tile.onload = null;
+      tile.onerror = null;
+      if (tile._offlineObjectUrl) {
+        URL.revokeObjectURL(tile._offlineObjectUrl);
+        tile._offlineObjectUrl = undefined;
+      }
+    });
+    return layer;
+  }
+
+  function setBaseMapMode(mode: "online" | "offline"): void {
+    if (!map || !onlineBaseLayer) return;
+    if (mode === "offline" && !offlineBaseLayer) return;
+
+    const targetLayer = mode === "offline" ? offlineBaseLayer : onlineBaseLayer;
+    if (offlineBaseLayer && map.hasLayer(offlineBaseLayer)) {
+      map.removeLayer(offlineBaseLayer);
+    }
+    if (onlineBaseLayer && map.hasLayer(onlineBaseLayer)) {
+      map.removeLayer(onlineBaseLayer);
+    }
+    targetLayer?.addTo(map);
+    baseMapMode = mode;
+  }
+
+  function syncOfflineBaseLayer(packageInfo: OfflineMapPackage | null): void {
+    if (!map || !onlineBaseLayer) return;
 
     if (offlineBaseLayer) {
       if (map.hasLayer(offlineBaseLayer)) map.removeLayer(offlineBaseLayer);
-      baseLayerControl.removeLayer(offlineBaseLayer);
       offlineBaseLayer = null;
     }
+    hasOfflineMap = Boolean(packageInfo);
 
-    if (!archive) {
-      if (!map.hasLayer(onlineBaseLayer)) onlineBaseLayer.addTo(map);
+    if (!packageInfo) {
+      setBaseMapMode("online");
       return;
     }
 
-    const attribution = escapeHtml(archive.info.attribution);
+    const info = packageInfo.info;
     const bounds = L.latLngBounds(
-      [archive.header.minLat, archive.header.minLon],
-      [archive.header.maxLat, archive.header.maxLon],
+      [info.minLat, info.minLon],
+      [info.maxLat, info.maxLon],
     );
     const tileOptions = {
-      attribution,
-      minZoom: archive.header.minZoom,
-      maxZoom: archive.header.maxZoom,
+      attribution: escapeHtml(info.attribution),
+      minZoom: info.minZoom,
+      maxZoom: info.maxZoom,
       bounds: bounds.isValid() ? bounds : undefined,
       noWrap: true,
     };
 
     let layer: L.Layer;
-    if (archive.header.tileType === TileType.Mvt) {
+    if (packageInfo.kind === "xyz") {
+      layer = createXyzOfflineLayer(packageInfo, bounds);
+    } else if (packageInfo.header.tileType === TileType.Mvt) {
       layer = protomapsLeafletLayer({
         ...tileOptions,
-        url: archive.pmtiles,
+        url: packageInfo.pmtiles,
         flavor: "light",
         lang: "fa",
-        maxDataZoom: archive.header.maxZoom,
+        maxDataZoom: packageInfo.header.maxZoom,
       }) as unknown as L.Layer;
     } else {
-      layer = leafletRasterLayer(archive.pmtiles, tileOptions) as L.Layer;
+      layer = leafletRasterLayer(packageInfo.pmtiles, tileOptions) as L.Layer;
       layer.on("tileunload", (event: L.TileEvent) => {
         const sourceUrl = event.tile.currentSrc || event.tile.src;
         if (sourceUrl.startsWith("blob:")) URL.revokeObjectURL(sourceUrl);
       });
     }
 
-    const layerName = `نقشه آفلاین · ${escapeHtml(archive.info.name)}`;
-    baseLayerControl.addBaseLayer(layer, layerName);
-
-    if (map.hasLayer(onlineBaseLayer)) map.removeLayer(onlineBaseLayer);
-    layer.addTo(map);
     offlineBaseLayer = layer;
-
+    setBaseMapMode("offline");
     if (bounds.isValid()) {
       map.fitBounds(bounds, {
         padding: [24, 24],
-        maxZoom: Math.min(13, archive.header.maxZoom),
+        maxZoom: Math.min(13, info.maxZoom),
       });
     }
   }
@@ -185,20 +278,13 @@
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         maxZoom: 19,
       },
-    );
-    baseLayerControl = L.control
-      .layers(
-        { "نقشه آنلاین (OpenStreetMap)": onlineBaseLayer },
-        undefined,
-        { collapsed: true, position: "topleft" },
-      )
-      .addTo(map);
+    ).addTo(map);
 
     const subscribeToOfflineMap = () => {
       if (isDisposed || !map) return;
       unsubscribeOfflineMap = offlineMap.subscribe(syncOfflineBaseLayer);
     };
-    void loadSavedOfflineMap()
+    void loadSavedOfflineMaps()
       .then(subscribeToOfflineMap)
       .catch((error) => {
         console.error("Error loading offline map package:", error);
@@ -913,6 +999,52 @@
         {/if}
       </div>
     </div>
+
+    <!-- Explicit basemap mode switch, placed directly beneath the coordinates card. -->
+    <div
+      class="absolute right-4 z-[999] w-56"
+      style={`top: ${showStatusInfo ? "7rem" : "4rem"};`}
+    >
+      <div class="bg-white/80 backdrop-blur-md rounded-lg shadow-lg p-3 space-y-2">
+        <div class="flex items-center justify-between gap-2">
+          <h3 class="font-medium text-sm">نقشهٔ پایه</h3>
+          <span class="badge badge-sm" class:badge-success={baseMapMode === "offline"} class:badge-info={baseMapMode === "online"}>
+            {baseMapMode === "offline" ? "آفلاین" : "آنلاین"}
+          </span>
+        </div>
+        <div class="join w-full" role="group" aria-label="انتخاب نقشه آنلاین یا آفلاین">
+          <button
+            type="button"
+            class="btn btn-sm join-item flex-1"
+            class:btn-primary={baseMapMode === "online"}
+            class:btn-outline={baseMapMode !== "online"}
+            aria-pressed={baseMapMode === "online"}
+            onclick={() => setBaseMapMode("online")}
+          >
+            آنلاین
+          </button>
+          <button
+            type="button"
+            class="btn btn-sm join-item flex-1"
+            class:btn-primary={baseMapMode === "offline"}
+            class:btn-outline={baseMapMode !== "offline"}
+            aria-pressed={baseMapMode === "offline"}
+            disabled={!hasOfflineMap}
+            onclick={() => setBaseMapMode("offline")}
+          >
+            آفلاین
+          </button>
+        </div>
+        {#if baseMapMode === "offline" && $offlineMap}
+          <p class="text-xs text-gray-600 truncate" title={$offlineMap.info.name}>
+            {$offlineMap.info.name}
+          </p>
+        {:else if !hasOfflineMap}
+          <p class="text-xs text-gray-500">بسته‌ای نصب نشده است</p>
+        {/if}
+      </div>
+    </div>
+
     <div class="absolute bottom-2 left-2 right-2 z-[1000] flex flex-col gap-2">
       <!-- Sent Pins Panel -->
       <div

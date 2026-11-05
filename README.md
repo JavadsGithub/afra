@@ -23,6 +23,14 @@ pnpm tauri build
 
 ## Offline maps
 
-Open **Settings → Offline map** and import a regional `.pmtiles` package. The archive is stored in the local WebView database on this device; it is not uploaded, and no map dataset is bundled with the app. Raster PMTiles packages are supported, along with vector packages that use the Protomaps Basemaps schema. The package's attribution is shown on the map; if it is missing from metadata, enter the attribution supplied by its provider when importing.
+The map has an explicit **Online / Offline** switch on the right, beneath the coordinates card. Online mode keeps the regular OpenStreetMap layer available for interactive viewing. Offline mode uses the currently active package. No map provider, geographic region, or map dataset is preselected or bundled with the app.
 
-Use a package whose provider and license permit offline use. AFRA does not download or prefetch tiles from `tile.openstreetmap.org`. The existing OpenStreetMap layer remains available as a normal, interactive online layer; use the Leaflet layer selector to switch between it and the imported offline package.
+Open **Settings → Offline maps** to manage installed packages. You can:
+
+- Import a regional `.pmtiles` archive. Raster PMTiles packages and vector packages compatible with the Protomaps Basemaps schema are supported. If the archive has no attribution metadata, enter the attribution required by its provider.
+- Download and install a raster region from a provider you configure. Enter its HTTPS XYZ tile URL template using `{z}`, `{x}`, and `{y}`, the provider's required attribution, a name, latitude/longitude bounds, and a zoom range. Choose a maximum zoom no higher than the provider supports; AFRA accepts zoom levels 0–22 and limits each download to 25,000 planned tiles. The provider must allow browser CORS requests.
+- Activate a different installed package or remove packages from this device.
+
+Before a regional download, AFRA requires you to confirm that the provider permits offline and bulk downloads. The downloader blocks `openstreetmap.org` and its subdomains: **do not use it for bulk downloads from the OpenStreetMap Standard tile service**. The ordinary online OpenStreetMap layer remains available for normal interactive map use. Use only a source whose terms explicitly permit offline use, and retain its required attribution.
+
+Imported archives and downloaded tiles are stored locally in the device's WebView IndexedDB and are not uploaded. Storage availability and quota depend on the device/browser; keep source packages and backups if needed.

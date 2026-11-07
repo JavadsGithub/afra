@@ -74,6 +74,24 @@
     let offlineMapAttribution = $state("");
     let offlineMapName = $state("");
 
+    interface PlaceSearchResult {
+        place_id: number;
+        display_name: string;
+        name?: string;
+        addresstype?: string;
+        type?: string;
+        boundingbox: string[];
+    }
+
+    let locationQuery = $state("");
+    let coordinateRadiusKm = $state<number | undefined>(undefined);
+    let selectedAreaLabel = $state("");
+    let placeResults = $state<PlaceSearchResult[]>([]);
+    let areaSearchError = $state("");
+    let isSearchingArea = $state(false);
+    let lastPlaceSearchAt = 0;
+    const placeSearchCache = new Map<string, PlaceSearchResult[]>();
+
     let regionName = $state("");
     let tileUrlTemplate = $state("");
     let regionSouth = $state<number | undefined>(undefined);
@@ -95,6 +113,182 @@
         minZoom: Number(regionMinZoom),
         maxZoom: Number(regionMaxZoom),
     }));
+    let hasSelectedArea = $derived(
+        Boolean(selectedAreaLabel) &&
+        [regionSouth, regionWest, regionNorth, regionEast].every(
+            (value) => typeof value === "number" && Number.isFinite(value),
+        ) &&
+        (regionSouth ?? 0) < (regionNorth ?? 0) &&
+        (regionWest ?? 0) < (regionEast ?? 0) &&
+        (regionSouth ?? 0) >= -85.05112878 &&
+        (regionNorth ?? 0) <= 85.05112878 &&
+        (regionWest ?? 0) >= -180 &&
+        (regionEast ?? 0) <= 180,
+    );
+
+    function isPlaceSearchResult(value: unknown): value is PlaceSearchResult {
+        if (!value || typeof value !== "object") return false;
+        const item = value as Record<string, unknown>;
+        return typeof item.place_id === "number" &&
+            typeof item.display_name === "string" &&
+            (item.name === undefined || typeof item.name === "string") &&
+            (item.addresstype === undefined || typeof item.addresstype === "string") &&
+            (item.type === undefined || typeof item.type === "string") &&
+            Array.isArray(item.boundingbox) &&
+            item.boundingbox.length >= 4;
+    }
+
+    function setSelectedArea(
+        south: number,
+        west: number,
+        north: number,
+        east: number,
+        label: string,
+        name: string,
+    ): boolean {
+        if (![south, west, north, east].every(Number.isFinite) || west >= east || south >= north) {
+            areaSearchError = "محدودهٔ مکان معتبر نیست؛ مکان دیگری را انتخاب کنید.";
+            return false;
+        }
+
+        const clippedSouth = Math.max(-85.05112878, south);
+        const clippedNorth = Math.min(85.05112878, north);
+        if (clippedSouth >= clippedNorth || west < -180 || east > 180) {
+            areaSearchError = "این مکان برای نقشهٔ وب قابل استفاده نیست یا از نصف‌النهار ۱۸۰° عبور می‌کند.";
+            return false;
+        }
+
+        regionSouth = clippedSouth;
+        regionWest = west;
+        regionNorth = clippedNorth;
+        regionEast = east;
+        selectedAreaLabel = label;
+        regionName = name.trim() || label.split(",")[0].trim() || "نقشه آفلاین";
+        placeResults = [];
+        areaSearchError = "";
+        return true;
+    }
+
+    function handleCoordinateArea(lat: number, lon: number) {
+        if (lat < -85.05112878 || lat > 85.05112878) {
+            areaSearchError = "عرض جغرافیایی برای کاشی‌های وب باید بین ‎−85.05° و 85.05° باشد.";
+            return;
+        }
+        if (!Number.isFinite(coordinateRadiusKm) || !coordinateRadiusKm || coordinateRadiusKm <= 0 || coordinateRadiusKm > 250) {
+            areaSearchError = "برای مختصات، شعاعی بین ۰٫۱ تا ۲۵۰ کیلومتر وارد کنید.";
+            return;
+        }
+
+        const latitudeDelta = coordinateRadiusKm / 111.32;
+        const longitudeScale = Math.max(Math.abs(Math.cos((lat * Math.PI) / 180)), 0.01);
+        const longitudeDelta = coordinateRadiusKm / (111.32 * longitudeScale);
+        const south = Math.max(-85.05112878, lat - latitudeDelta);
+        const north = Math.min(85.05112878, lat + latitudeDelta);
+        const west = lon - longitudeDelta;
+        const east = lon + longitudeDelta;
+        const label = `حدود ${coordinateRadiusKm} کیلومتر پیرامون ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+        setSelectedArea(south, west, north, east, label, `مختصات ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+    }
+
+    async function resolveLocationQuery() {
+        const query = locationQuery.trim();
+        areaSearchError = "";
+        placeResults = [];
+        if (!query) {
+            areaSearchError = "نام شهر، استان/ایالت، کشور یا مختصات را وارد کنید.";
+            return;
+        }
+        if (query.length > 200) {
+            areaSearchError = "عبارت جستجو بیش از حد طولانی است.";
+            return;
+        }
+
+        const coordinatePair = query.match(/^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[,; ]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$/);
+        if (coordinatePair) {
+            const lat = Number(coordinatePair[1]);
+            const lon = Number(coordinatePair[2]);
+            if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+                areaSearchError = "مختصات را به‌ترتیب عرض، طول وارد کنید؛ عرض ±۹۰ و طول ±۱۸۰ درجه است.";
+                return;
+            }
+            handleCoordinateArea(lat, lon);
+            return;
+        }
+
+        const cacheKey = query.toLocaleLowerCase();
+        const cachedResults = placeSearchCache.get(cacheKey);
+        if (cachedResults) {
+            placeResults = cachedResults;
+            if (cachedResults.length === 0) areaSearchError = "مکانی پیدا نشد؛ نام شهر، استان یا کشور را دقیق‌تر وارد کنید.";
+            return;
+        }
+
+        isSearchingArea = true;
+        try {
+            const waitMs = Math.max(0, 1000 - (Date.now() - lastPlaceSearchAt));
+            if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+            lastPlaceSearchAt = Date.now();
+
+            const url = new URL("https://nominatim.openstreetmap.org/search");
+            url.searchParams.set("q", query);
+            url.searchParams.set("format", "jsonv2");
+            url.searchParams.set("addressdetails", "1");
+            url.searchParams.set("limit", "6");
+            url.searchParams.set("accept-language", "fa,en");
+
+            const response = await fetch(url, { headers: { Accept: "application/json" } });
+            if (response.status === 429) {
+                throw new Error("سرویس جستجوی مکان موقتاً محدود شده است؛ کمی بعد دوباره تلاش کنید.");
+            }
+            if (!response.ok) throw new Error(`جستجوی مکان ناموفق بود (HTTP ${response.status}).`);
+
+            const data: unknown = await response.json();
+            if (!Array.isArray(data)) throw new Error("پاسخ سرویس جستجوی مکان معتبر نیست.");
+            const results = data.filter(isPlaceSearchResult);
+            placeSearchCache.set(cacheKey, results);
+            placeResults = results;
+            if (results.length === 0) areaSearchError = "مکانی پیدا نشد؛ نام شهر، استان یا کشور را دقیق‌تر وارد کنید.";
+        } catch (error) {
+            areaSearchError = error instanceof Error
+                ? error.message
+                : "جستجوی مکان ناموفق بود؛ مختصات را مستقیم وارد کنید.";
+        } finally {
+            isSearchingArea = false;
+        }
+    }
+
+    function selectPlaceResult(result: PlaceSearchResult) {
+        const bounds = result.boundingbox.slice(0, 4).map(Number);
+        if (bounds.some((value) => !Number.isFinite(value))) {
+            areaSearchError = "محدودهٔ این نتیجه قابل خواندن نیست.";
+            return;
+        }
+        const [south, north, west, east] = bounds;
+        const name = result.name?.trim() || result.display_name.split(",")[0].trim();
+        setSelectedArea(south, west, north, east, result.display_name, name);
+    }
+
+    function handleAreaSearchSubmit(event: SubmitEvent) {
+        event.preventDefault();
+        void resolveLocationQuery();
+    }
+
+    function markManualArea() {
+        if (selectedAreaLabel !== "محدودهٔ دستی") regionName = "محدودهٔ دستی";
+        selectedAreaLabel = "محدودهٔ دستی";
+        areaSearchError = "";
+    }
+
+    function clearSelectedArea() {
+        selectedAreaLabel = "";
+        regionName = "";
+        regionSouth = undefined;
+        regionWest = undefined;
+        regionNorth = undefined;
+        regionEast = undefined;
+        placeResults = [];
+        areaSearchError = "";
+    }
 
     async function loadOfflineMapInfo() {
         offlineMapLoading = true;
@@ -797,74 +991,172 @@
 
                         <section class="rounded-lg border border-base-300 bg-base-100 p-4 space-y-4">
                             <div>
-                                <h4 class="font-semibold">دانلود کاشی‌های یک منطقه</h4>
-                                <p class="text-xs text-gray-500 mt-1">
-                                    نشانی قالب XYZ و سقف زوم ارائه‌دهنده را وارد کنید. الگو باید شامل {"{z}"}, {"{x}"} و {"{y}"} باشد؛ حداکثر زوم برنامه ۲۲ است. سقف بسته ۲۵٬۰۰۰ کاشی است.
+                                <h4 class="font-semibold">انتخاب محدوده</h4>
+                                <p class="text-sm text-gray-600 mt-1">
+                                    نام یک شهر، استان/ایالت یا کشور را جستجو کنید؛ یا مختصات را به‌شکل عرض، طول وارد کنید.
                                 </p>
                             </div>
 
-                            <div class="form-control">
-                                <label class="label" for="offline-tile-url">
-                                    <span class="label-text">قالب نشانی HTTPS کاشی</span>
+                            <form class="space-y-3" onsubmit={handleAreaSearchSubmit}>
+                                <label class="label" for="offline-location-query">
+                                    <span class="label-text">نام مکان یا مختصات</span>
                                 </label>
-                                <input
-                                    id="offline-tile-url"
-                                    class="input input-bordered"
-                                    type="text"
-                                    bind:value={tileUrlTemplate}
-                                    placeholder="https://tiles.example.com/&#123;z&#125;/&#123;x&#125;/&#123;y&#125;.png"
-                                    disabled={isDownloadingRegion}
-                                    autocomplete="off"
-                                />
-                            </div>
+                                <div class="flex flex-col sm:flex-row gap-2">
+                                    <input
+                                        id="offline-location-query"
+                                        class="input input-bordered flex-1"
+                                        bind:value={locationQuery}
+                                        oninput={clearSelectedArea}
+                                        placeholder="مثلاً شهر، استان/ایالت، کشور یا lat, lon"
+                                        disabled={isSearchingArea || isDownloadingRegion}
+                                        autocomplete="off"
+                                    />
+                                    <button class="btn btn-outline" type="submit" disabled={isSearchingArea || isDownloadingRegion || !locationQuery.trim()}>
+                                        {#if isSearchingArea}<span class="loading loading-spinner loading-sm"></span>{/if}
+                                        پیدا کردن مکان
+                                    </button>
+                                </div>
+                                <div class="grid grid-cols-1 sm:grid-cols-[minmax(0,12rem)_1fr] gap-3 items-end">
+                                    <div class="form-control">
+                                        <label class="label" for="coordinate-radius">
+                                            <span class="label-text">شعاع دور مختصات (کیلومتر)</span>
+                                        </label>
+                                        <input
+                                            id="coordinate-radius"
+                                            class="input input-bordered"
+                                            type="number"
+                                            min="0.1"
+                                            max="250"
+                                            step="any"
+                                            bind:value={coordinateRadiusKm}
+                                            placeholder="مثلاً 5"
+                                            disabled={isSearchingArea || isDownloadingRegion}
+                                        />
+                                    </div>
+                                    <p class="text-xs text-gray-500 pb-3">
+                                        شعاع فقط برای مختصات لازم است. نام مکان تنها با فشردن دکمه به Nominatim فرستاده می‌شود (<a class="link" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a>). منبع کاشی دانلود را جداگانه انتخاب می‌کنید.
+                                    </p>
+                                </div>
+                            </form>
 
-                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                                <div class="form-control">
-                                    <label class="label" for="region-name"><span class="label-text">نام بسته</span></label>
-                                    <input id="region-name" class="input input-bordered" bind:value={regionName} placeholder="نام دلخواه" disabled={isDownloadingRegion} />
+                            {#if placeResults.length > 0}
+                                <div class="space-y-2" aria-label="نتایج جستجوی مکان">
+                                    <p class="text-sm font-medium">مکان درست را انتخاب کنید:</p>
+                                    {#each placeResults as result (result.place_id)}
+                                        <button
+                                            type="button"
+                                            class="btn btn-ghost border border-base-300 h-auto min-h-0 w-full justify-start whitespace-normal py-3 text-left"
+                                            onclick={() => selectPlaceResult(result)}
+                                        >
+                                            <span class="block min-w-0">
+                                                <span class="flex flex-wrap items-center gap-2 font-medium">
+                                                    {result.name || result.display_name.split(",")[0]}
+                                                    <span class="badge badge-sm badge-ghost">{result.addresstype || result.type || "مکان"}</span>
+                                                </span>
+                                                <span class="block text-xs text-gray-500 font-normal mt-1">{result.display_name}</span>
+                                            </span>
+                                        </button>
+                                    {/each}
                                 </div>
-                                <div class="form-control">
-                                    <label class="label" for="region-attribution"><span class="label-text">انتساب منبع</span></label>
-                                    <input id="region-attribution" class="input input-bordered" bind:value={regionAttribution} placeholder="متن انتساب طبق شرایط ارائه‌دهنده" disabled={isDownloadingRegion} />
+                            {/if}
+
+                            {#if areaSearchError}
+                                <div class="alert alert-error" role="alert"><span>{areaSearchError}</span></div>
+                            {/if}
+
+                            {#if hasSelectedArea}
+                                <div class="rounded-lg border border-success/30 bg-success/5 p-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <p class="text-xs text-gray-500">محدودهٔ انتخاب‌شده</p>
+                                        <p class="font-medium break-words">{selectedAreaLabel}</p>
+                                        <p class="text-xs text-gray-500 mt-1" dir="ltr">
+                                            {regionSouth?.toFixed(4)}, {regionWest?.toFixed(4)} — {regionNorth?.toFixed(4)}, {regionEast?.toFixed(4)}
+                                        </p>
+                                    </div>
+                                    <button class="btn btn-sm btn-ghost shrink-0" type="button" onclick={clearSelectedArea} disabled={isDownloadingRegion}>
+                                        تغییر محدوده
+                                    </button>
                                 </div>
-                                <div class="form-control">
-                                    <label class="label" for="region-south"><span class="label-text">عرض جنوبی (°)</span></label>
-                                    <input id="region-south" class="input input-bordered" type="number" min="-85.05112878" max="85.05112878" step="any" bind:value={regionSouth} disabled={isDownloadingRegion} />
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="region-west"><span class="label-text">طول غربی (°)</span></label>
-                                    <input id="region-west" class="input input-bordered" type="number" min="-180" max="180" step="any" bind:value={regionWest} disabled={isDownloadingRegion} />
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="region-north"><span class="label-text">عرض شمالی (°)</span></label>
-                                    <input id="region-north" class="input input-bordered" type="number" min="-85.05112878" max="85.05112878" step="any" bind:value={regionNorth} disabled={isDownloadingRegion} />
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="region-east"><span class="label-text">طول شرقی (°)</span></label>
-                                    <input id="region-east" class="input input-bordered" type="number" min="-180" max="180" step="any" bind:value={regionEast} disabled={isDownloadingRegion} />
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="region-min-zoom"><span class="label-text">حداقل زوم</span></label>
-                                    <input id="region-min-zoom" class="input input-bordered" type="number" min="0" max="22" step="1" bind:value={regionMinZoom} disabled={isDownloadingRegion} />
-                                </div>
-                                <div class="form-control">
-                                    <label class="label" for="region-max-zoom"><span class="label-text">حداکثر زوم منبع</span></label>
-                                    <input id="region-max-zoom" class="input input-bordered" type="number" min="0" max="22" step="1" bind:value={regionMaxZoom} disabled={isDownloadingRegion} />
-                                </div>
-                            </div>
+                            {/if}
 
                             <div class="rounded-md bg-base-200 p-3 text-sm" aria-live="polite">
-                                {#if estimatedRegionTiles > 0}
-                                    <span>برآورد: {estimatedRegionTiles.toLocaleString()} کاشی</span>
+                                {#if estimatedRegionTiles > 0 && estimatedRegionTiles <= 25000}
+                                    <span>برآورد دانلود: {estimatedRegionTiles.toLocaleString()} کاشی</span>
+                                {:else if estimatedRegionTiles > 25000}
+                                    <span class="text-error">این محدوده بیش از سقف ۲۵٬۰۰۰ کاشی است. محدوده یا زوم را در تنظیمات پیشرفته کاهش دهید.</span>
+                                {:else if !hasSelectedArea}
+                                    <span class="text-gray-500">ابتدا مکان یا مختصات را انتخاب کنید.</span>
                                 {:else}
-                                    <span class="text-gray-500">برای برآورد، محدوده و بازهٔ زوم معتبر وارد کنید (عرض: ‎−85.05° تا 85.05° برای کاشی‌های وب).</span>
+                                    <span class="text-gray-500">برای برآورد، منبع و بازهٔ زوم را در تنظیمات پیشرفته وارد کنید.</span>
                                 {/if}
                             </div>
 
-                            <label class="label cursor-pointer justify-start items-start gap-3 whitespace-normal">
-                                <input class="checkbox checkbox-primary mt-1 shrink-0" type="checkbox" bind:checked={confirmsOfflinePermission} disabled={isDownloadingRegion} />
-                                <span class="label-text text-sm">تأیید می‌کنم که ارائه‌دهندهٔ این منبع، دانلود انبوه و استفادهٔ آفلاین را مجاز می‌داند و من شرایط و محدودیت‌های آن را رعایت می‌کنم.</span>
-                            </label>
+                            <details class="rounded-lg border border-base-300 p-4">
+                                <summary class="cursor-pointer font-medium">تنظیمات دانلود (پیشرفته)</summary>
+                                <div class="space-y-4 mt-4">
+                                    <p class="text-xs text-gray-500">
+                                        منبع HTTPS باید اجازهٔ استفادهٔ آفلاین بدهد. حداکثر زوم پشتیبانی‌شدهٔ منبع را وارد کنید؛ سقف برنامه ۲۲ و حداکثر هر بسته ۲۵٬۰۰۰ کاشی است.
+                                    </p>
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                        <div class="form-control sm:col-span-2">
+                                            <label class="label" for="offline-tile-url"><span class="label-text">قالب نشانی کاشی HTTPS</span></label>
+                                            <input
+                                                id="offline-tile-url"
+                                                class="input input-bordered"
+                                                type="text"
+                                                bind:value={tileUrlTemplate}
+                                                placeholder="https://tiles.example.com/&#123;z&#125;/&#123;x&#125;/&#123;y&#125;.png"
+                                                disabled={isDownloadingRegion}
+                                                autocomplete="off"
+                                            />
+                                            <span class="text-xs text-gray-500 mt-1">الگو باید شامل &#123;z&#125;، &#123;x&#125; و &#123;y&#125; باشد.</span>
+                                        </div>
+                                        <div class="form-control">
+                                            <label class="label" for="region-name"><span class="label-text">نام بسته</span></label>
+                                            <input id="region-name" class="input input-bordered" bind:value={regionName} placeholder="نام دلخواه" disabled={isDownloadingRegion} />
+                                        </div>
+                                        <div class="form-control">
+                                            <label class="label" for="region-attribution"><span class="label-text">انتساب منبع</span></label>
+                                            <input id="region-attribution" class="input input-bordered" bind:value={regionAttribution} placeholder="طبق شرایط ارائه‌دهنده" disabled={isDownloadingRegion} />
+                                        </div>
+                                        <div class="form-control">
+                                            <label class="label" for="region-min-zoom"><span class="label-text">حداقل زوم</span></label>
+                                            <input id="region-min-zoom" class="input input-bordered" type="number" min="0" max="22" step="1" bind:value={regionMinZoom} disabled={isDownloadingRegion} />
+                                        </div>
+                                        <div class="form-control">
+                                            <label class="label" for="region-max-zoom"><span class="label-text">حداکثر زوم منبع</span></label>
+                                            <input id="region-max-zoom" class="input input-bordered" type="number" min="0" max="22" step="1" bind:value={regionMaxZoom} disabled={isDownloadingRegion} />
+                                        </div>
+                                    </div>
+
+                                    <details class="rounded-lg border border-base-300 p-3">
+                                        <summary class="cursor-pointer text-sm">ویرایش دستی مختصات محدوده</summary>
+                                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+                                            <div class="form-control">
+                                                <label class="label" for="region-south"><span class="label-text">عرض جنوبی (°)</span></label>
+                                                <input id="region-south" class="input input-bordered" type="number" min="-85.05112878" max="85.05112878" step="any" bind:value={regionSouth} oninput={markManualArea} disabled={isDownloadingRegion} />
+                                            </div>
+                                            <div class="form-control">
+                                                <label class="label" for="region-west"><span class="label-text">طول غربی (°)</span></label>
+                                                <input id="region-west" class="input input-bordered" type="number" min="-180" max="180" step="any" bind:value={regionWest} oninput={markManualArea} disabled={isDownloadingRegion} />
+                                            </div>
+                                            <div class="form-control">
+                                                <label class="label" for="region-north"><span class="label-text">عرض شمالی (°)</span></label>
+                                                <input id="region-north" class="input input-bordered" type="number" min="-85.05112878" max="85.05112878" step="any" bind:value={regionNorth} oninput={markManualArea} disabled={isDownloadingRegion} />
+                                            </div>
+                                            <div class="form-control">
+                                                <label class="label" for="region-east"><span class="label-text">طول شرقی (°)</span></label>
+                                                <input id="region-east" class="input input-bordered" type="number" min="-180" max="180" step="any" bind:value={regionEast} oninput={markManualArea} disabled={isDownloadingRegion} />
+                                            </div>
+                                        </div>
+                                    </details>
+
+                                    <label class="label cursor-pointer justify-start items-start gap-3 whitespace-normal">
+                                        <input class="checkbox checkbox-primary mt-1 shrink-0" type="checkbox" bind:checked={confirmsOfflinePermission} disabled={isDownloadingRegion} />
+                                        <span class="label-text text-sm">تأیید می‌کنم که ارائه‌دهنده، دانلود انبوه و استفادهٔ آفلاین را مجاز می‌داند و شرایطش را رعایت می‌کنم.</span>
+                                    </label>
+                                </div>
+                            </details>
 
                             {#if downloadProgress}
                                 <div class="space-y-1" aria-live="polite">
@@ -875,11 +1167,11 @@
                                 </div>
                             {/if}
 
-                            <div class="flex flex-wrap gap-2">
+                            <div class="flex flex-wrap gap-2 items-center">
                                 <button
                                     class="btn btn-primary"
                                     onclick={startRegionDownload}
-                                    disabled={isDownloadingRegion || offlineMapLoading || isInspectingOfflineMap || isSavingOfflineMap || !confirmsOfflinePermission || !regionName.trim() || !tileUrlTemplate.trim() || !regionAttribution.trim() || estimatedRegionTiles === 0}
+                                    disabled={isDownloadingRegion || offlineMapLoading || isInspectingOfflineMap || isSavingOfflineMap || !hasSelectedArea || !confirmsOfflinePermission || !regionName.trim() || !tileUrlTemplate.trim() || !regionAttribution.trim() || estimatedRegionTiles === 0 || estimatedRegionTiles > 25000}
                                 >
                                     {#if isDownloadingRegion}
                                         <span class="loading loading-spinner loading-sm"></span>
@@ -896,6 +1188,8 @@
                                     >
                                         {downloadProgress && downloadProgress.total > 0 && downloadProgress.completed >= downloadProgress.total ? "در حال ذخیره..." : "لغو دانلود"}
                                     </button>
+                                {:else if hasSelectedArea && (!tileUrlTemplate.trim() || !regionAttribution.trim() || regionMinZoom === undefined || regionMaxZoom === undefined)}
+                                    <span class="text-xs text-gray-500">برای دانلود، تنظیمات پیشرفته را تکمیل کنید.</span>
                                 {/if}
                             </div>
                         </section>

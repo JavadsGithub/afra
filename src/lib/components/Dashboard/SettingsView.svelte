@@ -22,6 +22,7 @@
         estimateRegionTileCount,
         inspectOfflineMap,
         loadSavedOfflineMaps,
+        MAX_REGION_TILE_COUNT,
         offlineMap,
         offlineMaps,
         removeOfflineMap,
@@ -137,6 +138,32 @@
             item.boundingbox.length >= 4;
     }
 
+    function placeTypeLabel(result: PlaceSearchResult): string {
+        const type = (result.addresstype || result.type || "").toLowerCase();
+        const labels: Record<string, string> = {
+            neighbourhood: "محله",
+            neighborhood: "محله",
+            quarter: "محله",
+            suburb: "محله/حومه",
+            city_district: "ناحیهٔ شهری",
+            district: "ناحیه",
+            borough: "بخش شهری",
+            village: "روستا",
+            hamlet: "آبادی",
+            isolated_dwelling: "آبادی",
+            town: "شهرک",
+            city: "شهر",
+            locality: "محدودهٔ محلی",
+            county: "شهرستان",
+            municipality: "شهرداری/شهرستان",
+            province: "استان",
+            state: "استان/ایالت",
+            country: "کشور",
+            administrative: "محدودهٔ اداری",
+        };
+        return labels[type] || result.addresstype || result.type || "مکان";
+    }
+
     function setSelectedArea(
         south: number,
         west: number,
@@ -173,7 +200,7 @@
         areaSearchError = "";
         placeResults = [];
         if (!query) {
-            areaSearchError = "نام شهر، استان/ایالت، کشور یا مختصات را وارد کنید.";
+            areaSearchError = "نام محله، روستا، شهر، استان/ایالت یا کشور را وارد کنید.";
             return;
         }
         if (query.length > 200) {
@@ -197,7 +224,7 @@
         const cachedResults = placeSearchCache.get(cacheKey);
         if (cachedResults) {
             placeResults = cachedResults;
-            if (cachedResults.length === 0) areaSearchError = "مکانی پیدا نشد؛ نام شهر، استان یا کشور را دقیق‌تر وارد کنید.";
+            if (cachedResults.length === 0) areaSearchError = "مکانی پیدا نشد؛ نام محله، روستا، شهر، استان یا کشور را دقیق‌تر وارد کنید.";
             return;
         }
 
@@ -225,7 +252,7 @@
             const results = data.filter(isPlaceSearchResult);
             placeSearchCache.set(cacheKey, results);
             placeResults = results;
-            if (results.length === 0) areaSearchError = "مکانی پیدا نشد؛ نام شهر، استان یا کشور را دقیق‌تر وارد کنید.";
+            if (results.length === 0) areaSearchError = "مکانی پیدا نشد؛ نام محله، روستا، شهر، استان یا کشور را دقیق‌تر وارد کنید.";
         } catch (error) {
             areaSearchError = error instanceof Error
                 ? error.message
@@ -978,7 +1005,7 @@
                             <div>
                                 <h4 class="font-semibold">محدودهٔ کاری را انتخاب کنید</h4>
                                 <p class="text-sm text-gray-600 mt-1">
-                                    یک شهر/استان را جستجو کنید یا چهار گوشهٔ مستطیل را وارد کنید.
+                                    یک محله، روستا، شهر، استان یا کشور را جستجو کنید؛ یا چهار گوشهٔ مستطیل را وارد کنید.
                                 </p>
                             </div>
 
@@ -992,7 +1019,7 @@
                                     onclick={() => chooseAreaMode("place")}
                                     disabled={isDownloadingRegion}
                                 >
-                                    شهر، استان یا کشور
+                                    محله، روستا، شهر یا استان
                                 </button>
                                 <button
                                     type="button"
@@ -1010,7 +1037,7 @@
                             {#if areaInputMode === "place"}
                                 <form class="space-y-3" onsubmit={handleAreaSearchSubmit}>
                                     <label class="label" for="offline-location-query">
-                                        <span class="label-text">نام شهر، استان/ایالت یا کشور</span>
+                                        <span class="label-text">نام محله، روستا، شهر، استان یا کشور</span>
                                     </label>
                                     <div class="flex flex-col sm:flex-row gap-2">
                                         <input
@@ -1018,7 +1045,7 @@
                                             class="input input-bordered flex-1"
                                             bind:value={locationQuery}
                                             oninput={clearSelectedArea}
-                                            placeholder="نام مکان"
+                                            placeholder="محله، روستا، شهر یا استان"
                                             disabled={isSearchingArea || isDownloadingRegion}
                                             autocomplete="off"
                                         />
@@ -1044,7 +1071,7 @@
                                                 <span class="block min-w-0">
                                                     <span class="flex flex-wrap items-center gap-2 font-medium">
                                                         {result.name || result.display_name.split(",")[0]}
-                                                        <span class="badge badge-sm badge-ghost">{result.addresstype || result.type || "مکان"}</span>
+                                                        <span class="badge badge-sm badge-ghost">{placeTypeLabel(result)}</span>
                                                     </span>
                                                     <span class="block text-xs text-gray-500 font-normal mt-1">{result.display_name}</span>
                                                 </span>
@@ -1094,10 +1121,10 @@
                             {/if}
 
                             <div class="rounded-md bg-base-200 p-3 text-sm" aria-live="polite">
-                                {#if estimatedRegionTiles > 0 && estimatedRegionTiles <= 25000}
+                                {#if estimatedRegionTiles > 0 && estimatedRegionTiles <= MAX_REGION_TILE_COUNT}
                                     <span>برآورد دانلود: {estimatedRegionTiles.toLocaleString()} کاشی</span>
-                                {:else if estimatedRegionTiles > 25000}
-                                    <span class="text-error">این محدوده بیش از سقف ۲۵٬۰۰۰ کاشی است؛ محدوده را کوچک‌تر کنید یا بیشترین زوم را کاهش دهید.</span>
+                                {:else if estimatedRegionTiles > MAX_REGION_TILE_COUNT}
+                                    <span class="text-error">این محدوده بیش از سقف {MAX_REGION_TILE_COUNT.toLocaleString("fa-IR")} کاشی است؛ محدوده را کوچک‌تر کنید یا بیشترین زوم را کاهش دهید.</span>
                                 {:else if !hasSelectedArea}
                                     <span class="text-gray-500">ابتدا شهر/استان را انتخاب کنید یا یک مستطیل معتبر بسازید.</span>
                                 {:else if regionMaxZoom === undefined}
@@ -1168,7 +1195,7 @@
                                 <button
                                     class="btn btn-primary"
                                     onclick={startRegionDownload}
-                                    disabled={isDownloadingRegion || offlineMapLoading || isInspectingOfflineMap || isSavingOfflineMap || !hasSelectedArea || regionMaxZoom === undefined || !confirmsOfflinePermission || !regionName.trim() || !tileUrlTemplate.trim() || !regionAttribution.trim() || estimatedRegionTiles === 0 || estimatedRegionTiles > 25000}
+                                    disabled={isDownloadingRegion || offlineMapLoading || isInspectingOfflineMap || isSavingOfflineMap || !hasSelectedArea || regionMaxZoom === undefined || !confirmsOfflinePermission || !regionName.trim() || !tileUrlTemplate.trim() || !regionAttribution.trim() || estimatedRegionTiles === 0 || estimatedRegionTiles > MAX_REGION_TILE_COUNT}
                                 >
                                     {#if isDownloadingRegion}
                                         <span class="loading loading-spinner loading-sm"></span>

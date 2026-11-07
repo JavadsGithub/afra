@@ -9,7 +9,7 @@ const TILE_STORE = "tiles";
 const PREFERENCE_STORE = "preferences";
 const ACTIVE_MAP_KEY = "active";
 const LEGACY_MAP_ID = "legacy-pmtiles-map";
-const MAX_REGION_TILE_COUNT = 25_000;
+export const MAX_REGION_TILE_COUNT = 100_000;
 const MAX_LATITUDE = 85.05112878;
 
 export type OfflineMapKind = "pmtiles" | "xyz";

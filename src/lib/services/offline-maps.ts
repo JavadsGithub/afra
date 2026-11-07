@@ -9,11 +9,32 @@ const TILE_STORE = "tiles";
 const PREFERENCE_STORE = "preferences";
 const ACTIVE_MAP_KEY = "active";
 const LEGACY_MAP_ID = "legacy-pmtiles-map";
-export const MAX_REGION_TILE_COUNT = 100_000;
-const MAX_LATITUDE = 85.05112878;
 
-export type OfflineMapKind = "pmtiles" | "xyz";
+export type OfflineMapKind = "pmtiles" | "xyz" | "osm";
 export type OfflineMapTileKind = "vector" | "raster";
+
+export type OsmPosition = [longitude: number, latitude: number];
+export type OsmGeometry =
+  | { type: "Point"; coordinates: OsmPosition }
+  | { type: "LineString"; coordinates: OsmPosition[] }
+  | { type: "Polygon"; coordinates: OsmPosition[][] }
+  | { type: "MultiPolygon"; coordinates: OsmPosition[][][] };
+
+export interface OsmFeature {
+  type: "Feature";
+  id: string;
+  geometry: OsmGeometry;
+  properties: {
+    osmType: "node" | "way" | "relation";
+    osmId: string;
+    tags: Record<string, string>;
+  };
+}
+
+export interface OsmFeatureCollection {
+  type: "FeatureCollection";
+  features: OsmFeature[];
+}
 
 export interface OfflineMapInfo {
   id: string;
@@ -31,7 +52,6 @@ export interface OfflineMapInfo {
   maxLat: number;
   attribution: string;
   providerHost?: string;
-  tileSourceId?: string;
 }
 
 export interface PmtilesOfflineMap {
@@ -47,7 +67,13 @@ export interface XyzOfflineMap {
   info: OfflineMapInfo;
 }
 
-export type OfflineMapPackage = PmtilesOfflineMap | XyzOfflineMap;
+export interface OsmOfflineMap {
+  kind: "osm";
+  info: OfflineMapInfo;
+  data: OsmFeatureCollection;
+}
+
+export type OfflineMapPackage = PmtilesOfflineMap | XyzOfflineMap | OsmOfflineMap;
 
 export interface OfflineMapCandidate {
   file: File;
@@ -56,25 +82,12 @@ export interface OfflineMapCandidate {
   info: Omit<OfflineMapInfo, "id" | "kind" | "providerHost" | "tileCount">;
 }
 
-export interface RegionDownloadOptions {
+export interface OsmRegionDownloadOptions {
   name: string;
-  urlTemplate: string;
   south: number;
   west: number;
   north: number;
   east: number;
-  minZoom: number;
-  maxZoom: number;
-  attribution: string;
-  confirmsOfflinePermission: boolean;
-}
-
-export interface RegionDownloadProgress {
-  completed: number;
-  total: number;
-  storedTiles: number;
-  reusedTiles: number;
-  downloadedBytes: number;
 }
 
 interface StoredPmtilesMap {
@@ -94,7 +107,14 @@ interface StoredXyzMap {
   info: OfflineMapInfo;
 }
 
-type StoredOfflineMap = StoredPmtilesMap | StoredXyzMap;
+interface StoredOsmMap {
+  id: string;
+  kind: "osm";
+  info: OfflineMapInfo;
+  data: OsmFeatureCollection;
+}
+
+type StoredOfflineMap = StoredPmtilesMap | StoredXyzMap | StoredOsmMap;
 
 interface LegacyStoredMap {
   blob?: Blob;
@@ -102,16 +122,6 @@ interface LegacyStoredMap {
   fileType?: string;
   lastModified?: number;
   attribution?: string;
-}
-
-interface PlannedTile {
-  z: number;
-  x: number;
-  y: number;
-}
-
-interface TileEntry extends PlannedTile {
-  blob: Blob;
 }
 
 export const offlineMap = writable<OfflineMapPackage | null>(null);
@@ -324,130 +334,6 @@ export async function inspectOfflineMap(file: File): Promise<OfflineMapCandidate
   };
 }
 
-export function estimateRegionTileCount(options: {
-  south: number;
-  west: number;
-  north: number;
-  east: number;
-  minZoom: number;
-  maxZoom: number;
-}): number {
-  const { south, west, north, east, minZoom, maxZoom } = options;
-  if (
-    ![south, west, north, east, minZoom, maxZoom].every(Number.isFinite) ||
-    south >= north ||
-    west >= east ||
-    south < -MAX_LATITUDE ||
-    north > MAX_LATITUDE ||
-    west < -180 ||
-    east > 180 ||
-    !Number.isInteger(minZoom) ||
-    !Number.isInteger(maxZoom) ||
-    minZoom < 0 ||
-    maxZoom > 22 ||
-    minZoom > maxZoom
-  ) {
-    return 0;
-  }
-
-  let total = 0;
-  for (let zoom = minZoom; zoom <= maxZoom; zoom += 1) {
-    const range = tileRangeForBounds(south, west, north, east, zoom);
-    total += (range.maxX - range.minX + 1) * (range.maxY - range.minY + 1);
-  }
-  return total;
-}
-
-function tileRangeForBounds(
-  south: number,
-  west: number,
-  north: number,
-  east: number,
-  zoom: number,
-) {
-  const count = 2 ** zoom;
-  const toX = (longitude: number) =>
-    Math.max(0, Math.min(count - 1, Math.floor(((longitude + 180) / 360) * count)));
-  const toY = (latitude: number) => {
-    const clamped = Math.max(-MAX_LATITUDE, Math.min(MAX_LATITUDE, latitude));
-    const radians = (clamped * Math.PI) / 180;
-    const normalized =
-      (1 - Math.asinh(Math.tan(radians)) / Math.PI) / 2;
-    return Math.max(0, Math.min(count - 1, Math.floor(normalized * count)));
-  };
-
-  return {
-    minX: toX(west),
-    maxX: toX(east),
-    minY: toY(north),
-    maxY: toY(south),
-  };
-}
-
-function buildTilePlan(options: RegionDownloadOptions): PlannedTile[] {
-  const total = estimateRegionTileCount(options);
-  if (total === 0) {
-    throw new Error("محدوده جغرافیایی یا بازه زوم معتبر نیست");
-  }
-  if (total > MAX_REGION_TILE_COUNT) {
-    throw new Error(
-      `این محدوده ${total.toLocaleString()} کاشی دارد؛ سقف هر بسته ${MAX_REGION_TILE_COUNT.toLocaleString()} کاشی است. محدوده یا زوم را کاهش دهید.`,
-    );
-  }
-
-  const tiles: PlannedTile[] = [];
-  for (let zoom = options.minZoom; zoom <= options.maxZoom; zoom += 1) {
-    const range = tileRangeForBounds(
-      options.south,
-      options.west,
-      options.north,
-      options.east,
-      zoom,
-    );
-    for (let x = range.minX; x <= range.maxX; x += 1) {
-      for (let y = range.minY; y <= range.maxY; y += 1) {
-        tiles.push({ z: zoom, x, y });
-      }
-    }
-  }
-  return tiles;
-}
-
-function isOpenStreetMapStandardHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/\.$/, "");
-  return host === "openstreetmap.org" || host.endsWith(".openstreetmap.org");
-}
-
-function validateTileUrlTemplate(template: string): { host: string } {
-  if (!template.includes("{z}") || !template.includes("{x}") || !template.includes("{y}")) {
-    throw new Error("نشانی کاشی باید شامل {z}، {x} و {y} باشد");
-  }
-
-  let url: URL;
-  try {
-    url = new URL(
-      template
-        .replaceAll("{z}", "1")
-        .replaceAll("{x}", "1")
-        .replaceAll("{y}", "1")
-        .replaceAll("{s}", "a"),
-    );
-  } catch {
-    throw new Error("قالب نشانی کاشی معتبر نیست");
-  }
-  if (url.protocol !== "https:") {
-    throw new Error("برای دریافت بسته، نشانی ارائه‌دهنده باید HTTPS باشد");
-  }
-
-  const host = url.hostname.toLowerCase().replace(/\.$/, "");
-  if (isOpenStreetMapStandardHost(host)) {
-    throw new Error(
-      "دریافت انبوه از دامنه استاندارد OpenStreetMap مجاز نیست. از ارائه‌دهنده‌ای استفاده کنید که دانلود آفلاین را صریحاً مجاز می‌داند.",
-    );
-  }
-  return { host };
-}
-
 function makeId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
@@ -457,71 +343,6 @@ function makeId(): string {
 
 function tileKey(mapId: string, z: number, x: number, y: number): string {
   return `${mapId}/${z}/${x}/${y}`;
-}
-
-function tileSourceIdFor(template: string): string {
-  let first = 0x811c9dc5;
-  let second = 0x9e3779b9;
-  for (let index = 0; index < template.length; index += 1) {
-    const code = template.charCodeAt(index);
-    first = Math.imul(first ^ code, 0x01000193);
-    second = Math.imul(second ^ code, 0x85ebca6b);
-  }
-  return `${(first >>> 0).toString(16)}-${(second >>> 0).toString(16)}`;
-}
-
-async function listTileKeys(mapId: string): Promise<Set<string>> {
-  const database = await openDatabase();
-  const transaction = database.transaction(TILE_STORE, "readonly");
-  const prefix = `${mapId}/`;
-  const [keys] = await Promise.all([
-    requestResult(
-      transaction.objectStore(TILE_STORE).getAllKeys(
-        IDBKeyRange.bound(prefix, `${prefix}\uffff`),
-      ),
-    ),
-    transactionComplete(transaction),
-  ]);
-  return new Set(keys.map(String));
-}
-
-async function deleteTileEntries(mapId: string, entries: PlannedTile[]): Promise<void> {
-  if (entries.length === 0) return;
-  const database = await openDatabase();
-  const transaction = database.transaction(TILE_STORE, "readwrite");
-  const store = transaction.objectStore(TILE_STORE);
-  for (const entry of entries) {
-    store.delete(tileKey(mapId, entry.z, entry.x, entry.y));
-  }
-  await transactionComplete(transaction);
-}
-
-async function putTileBatch(mapId: string, entries: TileEntry[]): Promise<void> {
-  if (entries.length === 0) return;
-  const database = await openDatabase();
-  const transaction = database.transaction(TILE_STORE, "readwrite");
-  const store = transaction.objectStore(TILE_STORE);
-  for (const entry of entries) {
-    store.put(entry.blob, tileKey(mapId, entry.z, entry.x, entry.y));
-  }
-  await transactionComplete(transaction);
-}
-
-async function deleteTilePack(mapId: string): Promise<void> {
-  const database = await openDatabase();
-  const transaction = database.transaction(TILE_STORE, "readwrite");
-  const store = transaction.objectStore(TILE_STORE);
-  const prefix = `${mapId}/`;
-  const request = store.openCursor();
-  request.onsuccess = () => {
-    const cursor = request.result;
-    if (!cursor) return;
-    if (typeof cursor.key === "string" && cursor.key.startsWith(prefix)) {
-      cursor.delete();
-    }
-    cursor.continue();
-  };
-  await transactionComplete(transaction);
 }
 
 export async function loadOfflineTile(
@@ -559,6 +380,7 @@ async function listMapRecords(): Promise<StoredOfflineMap[]> {
 
 async function toPackage(record: StoredOfflineMap): Promise<OfflineMapPackage> {
   if (record.kind === "xyz") return { kind: "xyz", info: record.info };
+  if (record.kind === "osm") return { kind: "osm", info: record.info, data: record.data };
 
   const candidate = await inspectOfflineMap(createFile(record));
   const storedInfo = record.info;
@@ -574,7 +396,7 @@ async function toPackage(record: StoredOfflineMap): Promise<OfflineMapPackage> {
 }
 
 function infoForRecord(record: StoredOfflineMap): OfflineMapInfo | null {
-  if (record.kind === "xyz") return record.info;
+  if (record.kind !== "pmtiles") return record.info;
   return record.info ?? null;
 }
 
@@ -727,209 +549,314 @@ export async function removeOfflineMap(id: string): Promise<void> {
   }
 }
 
-export async function downloadRegionTiles(
-  options: RegionDownloadOptions,
-  onProgress: (progress: RegionDownloadProgress) => void,
-  signal: AbortSignal,
-): Promise<XyzOfflineMap> {
-  const name = options.name.trim();
-  const attribution = options.attribution.trim();
-  const urlTemplate = options.urlTemplate.trim();
-  if (!name) throw new Error("برای بسته نقشه یک نام وارد کنید");
-  if (!attribution) throw new Error("انتساب منبع نقشه الزامی است");
-  if (!options.confirmsOfflinePermission) {
-    throw new Error("برای ادامه باید تأیید کنید که منبع اجازه دانلود آفلاین می‌دهد");
-  }
-  const { host } = validateTileUrlTemplate(urlTemplate);
-  const plan = buildTilePlan(options);
-  const sourceId = tileSourceIdFor(urlTemplate);
-  const internalController = new AbortController();
-  const abortFromCaller = () => internalController.abort();
-  if (signal.aborted) internalController.abort();
-  signal.addEventListener("abort", abortFromCaller, { once: true });
+const OSM_API_URL = "https://api.openstreetmap.org/api/0.6/map";
+const MAX_OSM_BBOX_AREA = 0.25;
+const MAX_OSM_RESPONSE_BYTES = 25 * 1024 * 1024;
+const MAX_OSM_FEATURES = 50_000;
+const OSM_ATTRIBUTION = "© OpenStreetMap contributors";
 
-  let mapId = "";
-  let existingMap: StoredXyzMap | undefined;
-  let existingTileKeys = new Set<string>();
-  let nextIndex = 0;
-  let completed = 0;
-  let storedTiles = 0;
-  let reusedTiles = 0;
-  let downloadedBytes = 0;
-  let pendingEntries: TileEntry[] = [];
-  const newlyStoredTiles: PlannedTile[] = [];
-  let writeChain = Promise.resolve();
-  let writeFailure: unknown = null;
-  let workers: Promise<void>[] = [];
+const OSM_RENDERABLE_TAGS = [
+  "aeroway", "amenity", "barrier", "building", "craft", "emergency",
+  "healthcare", "highway", "historic", "landuse", "leisure", "man_made",
+  "military", "natural", "office", "place", "power", "public_transport",
+  "railway", "shop", "sport", "tourism", "water", "waterway",
+] as const;
+
+function osmTags(element: Element): Record<string, string> {
+  const tags: Record<string, string> = {};
+  for (const tag of Array.from(element.children)) {
+    if (tag.tagName !== "tag") continue;
+    const key = tag.getAttribute("k");
+    const value = tag.getAttribute("v");
+    if (key && value !== null) tags[key] = value;
+  }
+  return tags;
+}
+
+function hasRenderableOsmTags(tags: Record<string, string>): boolean {
+  return OSM_RENDERABLE_TAGS.some((key) => Boolean(tags[key]) && tags[key] !== "no");
+}
+
+function osmFeature(
+  osmType: OsmFeature["properties"]["osmType"],
+  osmId: string,
+  tags: Record<string, string>,
+  geometry: OsmGeometry,
+): OsmFeature {
+  return {
+    type: "Feature",
+    id: `${osmType}/${osmId}`,
+    geometry,
+    properties: { osmType, osmId, tags },
+  };
+}
+
+function isOsmArea(tags: Record<string, string>, coordinates: OsmPosition[]): boolean {
+  if (tags.area === "yes") return true;
+  if (tags.area === "no" || coordinates.length < 4) return false;
+  const first = coordinates[0];
+  const last = coordinates[coordinates.length - 1];
+  if (first[0] !== last[0] || first[1] !== last[1]) return false;
+  return [
+    "aeroway", "amenity", "building", "landuse", "leisure", "natural",
+    "office", "shop", "tourism", "water",
+  ].some((key) => Boolean(tags[key]) && tags[key] !== "no") || tags.waterway === "riverbank";
+}
+
+function samePosition(a: OsmPosition, b: OsmPosition): boolean {
+  return a[0] === b[0] && a[1] === b[1];
+}
+
+function stitchOsmRings(segments: OsmPosition[][]): OsmPosition[][] {
+  const remaining = segments.map((segment) => [...segment]);
+  const rings: OsmPosition[][] = [];
+
+  while (remaining.length > 0) {
+    const ring = remaining.shift()!;
+    let extended = true;
+    while (extended && ring.length > 1 && !samePosition(ring[0], ring[ring.length - 1])) {
+      extended = false;
+      const end = ring[ring.length - 1];
+      let index = remaining.findIndex((segment) =>
+        samePosition(segment[0], end) || samePosition(segment[segment.length - 1], end),
+      );
+      if (index >= 0) {
+        const [segment] = remaining.splice(index, 1);
+        if (samePosition(segment[0], end)) ring.push(...segment.slice(1));
+        else ring.push(...segment.slice(0, -1).reverse());
+        extended = true;
+        continue;
+      }
+
+      const start = ring[0];
+      index = remaining.findIndex((segment) =>
+        samePosition(segment[0], start) || samePosition(segment[segment.length - 1], start),
+      );
+      if (index < 0) continue;
+      const [segment] = remaining.splice(index, 1);
+      if (samePosition(segment[segment.length - 1], start)) {
+        ring.unshift(...segment.slice(0, -1));
+      } else {
+        ring.unshift(...segment.slice(1).reverse());
+      }
+      extended = true;
+    }
+    if (ring.length >= 4 && samePosition(ring[0], ring[ring.length - 1])) rings.push(ring);
+  }
+
+  return rings;
+}
+
+function pointInOsmRing(point: OsmPosition, ring: OsmPosition[]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    const crosses = (yi > point[1]) !== (yj > point[1]) &&
+      point[0] < ((xj - xi) * (point[1] - yi)) / (yj - yi) + xi;
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+function parseOsmMapXml(xml: string): OsmFeatureCollection {
+  if (typeof DOMParser === "undefined") {
+    throw new Error("دریافت نقشهٔ آفلاین در این محیط پشتیبانی نمی‌شود");
+  }
+  const document = new DOMParser().parseFromString(xml, "application/xml");
+  if (document.getElementsByTagName("parsererror").length > 0) {
+    throw new Error("پاسخ OpenStreetMap قابل خواندن نیست");
+  }
+
+  const nodes = new Map<string, OsmPosition>();
+  const features: OsmFeature[] = [];
+  for (const node of Array.from(document.getElementsByTagName("node"))) {
+    const id = node.getAttribute("id");
+    const lat = Number(node.getAttribute("lat"));
+    const lon = Number(node.getAttribute("lon"));
+    if (!id || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    const position: OsmPosition = [lon, lat];
+    nodes.set(id, position);
+    const tags = osmTags(node);
+    if (hasRenderableOsmTags(tags)) {
+      features.push(osmFeature("node", id, tags, { type: "Point", coordinates: position }));
+    }
+  }
+
+  const ways = new Map<string, { coordinates: OsmPosition[]; tags: Record<string, string> }>();
+  for (const way of Array.from(document.getElementsByTagName("way"))) {
+    const id = way.getAttribute("id");
+    if (!id) continue;
+    const coordinates = Array.from(way.getElementsByTagName("nd"))
+      .map((node) => nodes.get(node.getAttribute("ref") ?? ""))
+      .filter((position): position is OsmPosition => Boolean(position));
+    const tags = osmTags(way);
+    ways.set(id, { coordinates, tags });
+    if (!hasRenderableOsmTags(tags) || coordinates.length < 2) continue;
+
+    const geometry: OsmGeometry = isOsmArea(tags, coordinates)
+      ? { type: "Polygon", coordinates: [coordinates] }
+      : { type: "LineString", coordinates };
+    features.push(osmFeature("way", id, tags, geometry));
+  }
+
+  for (const relation of Array.from(document.getElementsByTagName("relation"))) {
+    const id = relation.getAttribute("id");
+    if (!id) continue;
+    const tags = osmTags(relation);
+    if (!hasRenderableOsmTags(tags) || !["multipolygon", "boundary"].includes(tags.type ?? "")) continue;
+
+    const outerSegments: OsmPosition[][] = [];
+    const innerSegments: OsmPosition[][] = [];
+    for (const member of Array.from(relation.getElementsByTagName("member"))) {
+      if (member.getAttribute("type") !== "way") continue;
+      const way = ways.get(member.getAttribute("ref") ?? "");
+      if (!way || way.coordinates.length < 2) continue;
+      if (member.getAttribute("role") === "inner") innerSegments.push(way.coordinates);
+      else outerSegments.push(way.coordinates);
+    }
+
+    const outerRings = stitchOsmRings(outerSegments);
+    if (outerRings.length === 0) continue;
+    const innerRings = stitchOsmRings(innerSegments);
+    const polygons = outerRings.map((outer) => [
+      outer,
+      ...innerRings.filter((inner) => pointInOsmRing(inner[0], outer)),
+    ]);
+    const geometry: OsmGeometry = polygons.length === 1
+      ? { type: "Polygon", coordinates: polygons[0] }
+      : { type: "MultiPolygon", coordinates: polygons };
+    features.push(osmFeature("relation", id, tags, geometry));
+  }
+
+  return { type: "FeatureCollection", features };
+}
+
+export async function downloadOsmRegion(
+  options: OsmRegionDownloadOptions,
+  signal: AbortSignal,
+): Promise<OsmOfflineMap> {
+  const { south, west, north, east } = options;
+  const name = options.name.trim() || "محدودهٔ آفلاین";
+  if (
+    ![south, west, north, east].every(Number.isFinite) ||
+    south >= north ||
+    west >= east ||
+    south < -85.05112878 ||
+    north > 85.05112878 ||
+    west < -180 ||
+    east > 180
+  ) {
+    throw new Error("چهار مختصات واردشده محدودهٔ معتبری نمی‌سازند");
+  }
+  if ((north - south) * (east - west) > MAX_OSM_BBOX_AREA) {
+    throw new Error("محدوده برای دریافت از OpenStreetMap بزرگ است؛ مستطیل کوچک‌تری انتخاب کنید");
+  }
+  if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
+
+  const existingRecord = (await listMapRecords()).find(
+    (record): record is StoredOsmMap =>
+      record.kind === "osm" &&
+      record.info.minLat === south &&
+      record.info.minLon === west &&
+      record.info.maxLat === north &&
+      record.info.maxLon === east,
+  );
+  if (existingRecord) {
+    const existingPackage = await activateOfflineMap(existingRecord.id);
+    if (existingPackage.kind === "osm") return existingPackage;
+  }
+
+  const url = new URL(OSM_API_URL);
+  url.searchParams.set("bbox", `${west},${south},${east},${north}`);
+  let response: Response;
+  try {
+    response = await fetch(url, { signal, headers: { Accept: "application/xml" } });
+  } catch (error) {
+    if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
+    throw new Error(`اتصال به OpenStreetMap ناموفق بود؛ ${error instanceof Error ? error.message : "دوباره تلاش کنید"}`);
+  }
+  if (response.status === 400) {
+    throw new Error("OpenStreetMap این محدوده را بزرگ تشخیص داد؛ مستطیل کوچک‌تری انتخاب کنید");
+  }
+  if (response.status === 429 || response.status === 503 || response.status === 509) {
+    throw new Error("سرویس OpenStreetMap موقتاً شلوغ است؛ کمی بعد دوباره تلاش کنید");
+  }
+  if (!response.ok) throw new Error(`دریافت داده از OpenStreetMap ناموفق بود (HTTP ${response.status})`);
+
+  const declaredSize = Number(response.headers.get("content-length"));
+  if (declaredSize > MAX_OSM_RESPONSE_BYTES) {
+    throw new Error("دادهٔ این محدوده برای ذخیره در این دستگاه بیش از حد بزرگ است؛ محدوده را کوچک‌تر کنید");
+  }
+  const xml = await response.text();
+  const responseBytes = new TextEncoder().encode(xml).byteLength;
+  if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
+  if (responseBytes > MAX_OSM_RESPONSE_BYTES) {
+    throw new Error("دادهٔ این محدوده برای ذخیره در این دستگاه بیش از حد بزرگ است؛ محدوده را کوچک‌تر کنید");
+  }
+
+  const data = parseOsmMapXml(xml);
+  if (data.features.length === 0) {
+    throw new Error("در این محدوده دادهٔ قابل‌نمایشی از OpenStreetMap پیدا نشد");
+  }
+  if (data.features.length > MAX_OSM_FEATURES) {
+    throw new Error("دادهٔ این محدوده بیش از حد بزرگ است؛ مستطیل کوچک‌تری انتخاب کنید");
+  }
+  const sizeBytes = new TextEncoder().encode(JSON.stringify(data)).byteLength;
+  if (sizeBytes > MAX_OSM_RESPONSE_BYTES) {
+    throw new Error("دادهٔ این محدوده برای ذخیره در این دستگاه بیش از حد بزرگ است؛ محدوده را کوچک‌تر کنید");
+  }
 
   try {
-    if (internalController.signal.aborted) {
-      throw new DOMException("Download cancelled", "AbortError");
-    }
+    await navigator.storage?.persist?.();
+  } catch {
+    // The browser may decline persistent-storage status; IndexedDB remains usable.
+  }
 
-    existingMap = (await listMapRecords()).find(
-      (record): record is StoredXyzMap =>
-        record.kind === "xyz" && record.info.tileSourceId === sourceId,
-    );
-    mapId = existingMap?.id ?? makeId();
-    if (existingMap) existingTileKeys = await listTileKeys(mapId);
-    const additionalTiles = plan.reduce(
-      (count, tile) =>
-        count + (existingTileKeys.has(tileKey(mapId, tile.z, tile.x, tile.y)) ? 0 : 1),
-      0,
-    );
-    if ((existingMap?.info.tileCount ?? 0) + additionalTiles > MAX_REGION_TILE_COUNT) {
-      throw new Error(
-        `با افزودن این محدوده، بسته از سقف ${MAX_REGION_TILE_COUNT.toLocaleString()} کاشی عبور می‌کند؛ محدوده را کوچک‌تر کنید یا بیشترین زوم را کاهش دهید.`,
-      );
-    }
-
-    const reportProgress = () =>
-      onProgress({
-        completed,
-        total: plan.length,
-        storedTiles,
-        reusedTiles,
-        downloadedBytes,
-      });
-
-    const queueBatch = (force = false) => {
-      if (pendingEntries.length < 64 && !force) return;
-      const batch = pendingEntries.splice(0);
-      if (batch.length === 0) return;
-      writeChain = writeChain.then(() => putTileBatch(mapId, batch));
-      void writeChain.catch((error: unknown) => {
-        writeFailure = error;
-        internalController.abort();
-      });
-    };
-
-    const worker = async () => {
-      while (!internalController.signal.aborted) {
-        const index = nextIndex++;
-        if (index >= plan.length) return;
-        const tile = plan[index];
-        const key = tileKey(mapId, tile.z, tile.x, tile.y);
-        if (existingTileKeys.has(key)) {
-          reusedTiles += 1;
-          completed += 1;
-          reportProgress();
-          continue;
-        }
-
-        const url = urlTemplate
-          .replaceAll("{z}", String(tile.z))
-          .replaceAll("{x}", String(tile.x))
-          .replaceAll("{y}", String(tile.y))
-          .replaceAll("{s}", "a");
-
-        let response: Response;
-        try {
-          response = await fetch(url, { signal: internalController.signal });
-        } catch (error) {
-          if (internalController.signal.aborted) return;
-          throw new Error(
-            `دریافت کاشی ناموفق بود؛ اتصال، CORS و نشانی ارائه‌دهنده را بررسی کنید (${error instanceof Error ? error.message : "network error"})`,
-          );
-        }
-
-        if (
-          response.url &&
-          isOpenStreetMapStandardHost(new URL(response.url).hostname)
-        ) {
-          throw new Error(
-            "دانلود از طریق تغییر مسیر به دامنه استاندارد OpenStreetMap مسدود شد.",
-          );
-        }
-
-        if (response.ok) {
-          const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-          if (contentType && !contentType.startsWith("image/") && !contentType.includes("octet-stream")) {
-            throw new Error("این نشانی کاشی رستری برنمی‌گرداند؛ برای دانلود منطقه، قالب XYZ تصویری لازم است");
-          }
-          const blob = await response.blob();
-          if (blob.size > 0) {
-            pendingEntries.push({ ...tile, blob });
-            newlyStoredTiles.push(tile);
-            storedTiles += 1;
-            downloadedBytes += blob.size;
-          }
-        } else if (response.status !== 404 && response.status !== 410) {
-          if (response.status === 429) {
-            throw new Error("ارائه‌دهنده درخواست‌ها را محدود کرد (HTTP 429). دانلود متوقف شد؛ شرایط و نرخ مجاز را بررسی کنید.");
-          }
-          throw new Error(`دریافت کاشی ناموفق بود (HTTP ${response.status})`);
-        }
-
-        completed += 1;
-        reportProgress();
-        queueBatch();
-      }
-    };
-
-    workers = Array.from({ length: Math.min(2, plan.length) }, () => worker());
-    await Promise.all(workers);
-    if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
-    if (writeFailure) throw writeFailure;
-    if (internalController.signal.aborted) throw new DOMException("Download cancelled", "AbortError");
-    queueBatch(true);
-    await writeChain;
-    if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
-    if (storedTiles + reusedTiles === 0) {
-      throw new Error("در این محدوده هیچ کاشی تصویری از ارائه‌دهنده دریافت نشد");
-    }
-
-    const previous = existingMap?.info;
-    const tileCount = (previous?.tileCount ?? 0) + storedTiles;
-    const info: OfflineMapInfo = {
-      id: mapId,
-      kind: "xyz",
-      name,
-      fileName: `${name} (${tileCount.toLocaleString()} tiles)`,
-      sizeBytes: (previous?.sizeBytes ?? 0) + downloadedBytes,
-      tileCount,
-      tileKind: "raster",
-      minZoom: Math.min(previous?.minZoom ?? options.minZoom, options.minZoom),
-      maxZoom: Math.max(previous?.maxZoom ?? options.maxZoom, options.maxZoom),
-      minLon: Math.min(previous?.minLon ?? options.west, options.west),
-      minLat: Math.min(previous?.minLat ?? options.south, options.south),
-      maxLon: Math.max(previous?.maxLon ?? options.east, options.east),
-      maxLat: Math.max(previous?.maxLat ?? options.north, options.north),
-      attribution,
-      providerHost: host,
-      tileSourceId: sourceId,
-    };
-    const record: StoredXyzMap = { id: mapId, kind: "xyz", info };
-    const database = await openDatabase();
-    if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
-    const transaction = database.transaction([MAP_STORE, PREFERENCE_STORE], "readwrite");
-    transaction.objectStore(MAP_STORE).put(record, mapId);
-    transaction.objectStore(PREFERENCE_STORE).put(mapId, ACTIVE_MAP_KEY);
-    await transactionComplete(transaction);
-
-    offlineMaps.update((maps) => [info, ...maps.filter((item) => item.id !== mapId)]);
-    const savedPackage: XyzOfflineMap = { kind: "xyz", info };
-    offlineMap.set(savedPackage);
-    loadPromise = Promise.resolve(savedPackage);
-    reportProgress();
-    return savedPackage;
-  } catch (error) {
-    internalController.abort();
-    await Promise.allSettled(workers);
-    await writeChain.catch(() => undefined);
+  const id = makeId();
+  const info: OfflineMapInfo = {
+    id,
+    kind: "osm",
+    name,
+    fileName: `${name}.geojson`,
+    sizeBytes,
+    tileCount: data.features.length,
+    tileKind: "vector",
+    minZoom: 0,
+    maxZoom: 22,
+    minLon: west,
+    minLat: south,
+    maxLon: east,
+    maxLat: north,
+    attribution: OSM_ATTRIBUTION,
+  };
+  const record: StoredOsmMap = { id, kind: "osm", info, data };
+  const database = await openDatabase();
+  if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
+  const transaction = database.transaction([MAP_STORE, PREFERENCE_STORE], "readwrite");
+  const abortTransaction = () => {
     try {
-      if (mapId) {
-        if (existingMap) await deleteTileEntries(mapId, newlyStoredTiles);
-        else await deleteTilePack(mapId);
-      }
+      transaction.abort();
     } catch {
-      // Preserve the original error if cleanup itself fails.
+      // It may have already completed.
     }
-    if (internalController.signal.aborted && signal.aborted) {
-      throw new DOMException("Download cancelled", "AbortError");
-    }
+  };
+  signal.addEventListener("abort", abortTransaction, { once: true });
+  try {
+    if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
+    transaction.objectStore(MAP_STORE).put(record, id);
+    transaction.objectStore(PREFERENCE_STORE).put(id, ACTIVE_MAP_KEY);
+    await transactionComplete(transaction);
+  } catch (error) {
+    if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
     throw error;
   } finally {
-    signal.removeEventListener("abort", abortFromCaller);
+    signal.removeEventListener("abort", abortTransaction);
   }
+
+  offlineMaps.update((maps) => [info, ...maps]);
+  const savedPackage: OsmOfflineMap = { kind: "osm", info, data };
+  offlineMap.set(savedPackage);
+  loadPromise = Promise.resolve(savedPackage);
+  return savedPackage;
 }

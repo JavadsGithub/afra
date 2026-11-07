@@ -23,15 +23,15 @@ pnpm tauri build
 
 ## Offline maps
 
-The map automatically uses its active offline package when one is installed; no online/offline switch is needed. Downloaded XYZ tiles are checked in local storage first, and the regular OpenStreetMap layer is used only for tiles not already saved. Without an active package, the map uses OpenStreetMap online. No map provider, geographic region, or map dataset is preselected or bundled with the app.
+The map automatically uses its active saved package; there is no online/offline switch. Downloaded OSM data is rendered from local storage inside its saved rectangle. The ordinary OpenStreetMap layer remains available for normal interactive viewing outside that region and when no package is active. No region or map dataset is preselected or bundled with the app.
 
-Open **Settings → Offline maps** to manage installed packages. You can:
+Open **Settings → Offline maps** to manage packages. You can:
 
+- Search for a neighborhood, suburb, village, town, city, province/state, or country and select its bounds, or enter the southern, western, northern, and eastern coordinates of a rectangle manually.
+- Download raw OpenStreetMap map data for the selected rectangle. The features are converted to GeoJSON, saved in the device's IndexedDB, and rendered by the app. Downloading the same rectangle again activates its saved package instead of requesting it again. Requests are kept to small areas and subject to OpenStreetMap API limits; choose a smaller rectangle if a request is rejected.
 - Import a regional `.pmtiles` archive. Raster PMTiles packages and vector packages compatible with the Protomaps Basemaps schema are supported. If the archive has no attribution metadata, enter the attribution required by its provider.
-- Choose an area by searching for a neighborhood, suburb, village, town, city, province/state, or country; select the matching result to fill its bounds. Or choose **Manual rectangle** and enter the southern/northern latitude and western/eastern longitude. Place lookup is sent only on submit to OpenStreetMap's Nominatim search service; the tile source is configured separately and is never preselected.
-- Set one maximum zoom. AFRA downloads levels 0 through that zoom (0–22), estimates tile count, and limits each package to 100,000 planned tiles. When the same tile source is used again, already-saved tiles are reused instead of requested again. The tile source, attribution, and offline permission are in the collapsed **Map source** settings.
-- Activate a different installed package or remove packages from this device.
+- Activate another installed package or remove packages from this device.
 
-Before a regional download, AFRA requires you to confirm that the provider permits offline and bulk downloads. The downloader blocks `openstreetmap.org` and its subdomains: **do not use it for bulk downloads from the OpenStreetMap Standard tile service**. The ordinary online OpenStreetMap layer remains available for normal interactive map use. Use only a source whose terms explicitly permit offline use, and retain its required attribution.
+AFRA does not bulk-download tiles from the OpenStreetMap Standard tile service. Ordinary interactive tile viewing remains available, and OSM attribution is retained for downloaded data and map display.
 
-Imported archives and downloaded tiles are stored locally in the device's WebView IndexedDB and are not uploaded. Storage availability and quota depend on the device/browser; keep source packages and backups if needed.
+Imported archives and downloaded OSM data are stored locally in the device's WebView IndexedDB and are not uploaded. Storage availability and quota depend on the device/browser; keep source packages and backups if needed.

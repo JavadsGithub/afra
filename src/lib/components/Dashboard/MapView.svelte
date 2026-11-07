@@ -9,6 +9,7 @@
     loadSavedOfflineMaps,
     offlineMap,
     type OfflineMapPackage,
+    type OsmOfflineMap,
     type PmtilesOfflineMap,
     type XyzOfflineMap,
   } from "$lib/services/offline-maps";
@@ -193,6 +194,115 @@
     return layer;
   }
 
+  function tileBoundsForCoords(coords: L.Coords): L.LatLngBounds | null {
+    const count = 2 ** coords.z;
+    if (coords.x < 0 || coords.x >= count || coords.y < 0 || coords.y >= count) return null;
+    const longitude = (x: number) => (x / count) * 360 - 180;
+    const latitude = (y: number) =>
+      (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / count))) * 180) / Math.PI;
+    return L.latLngBounds(
+      [latitude(coords.y), longitude(coords.x)],
+      [latitude(coords.y + 1), longitude(coords.x + 1)],
+    );
+  }
+
+  function createOsmRegionFallbackLayer(bounds: L.LatLngBounds): L.Layer {
+    const createTile = (coords: L.Coords, done: L.DoneCallback): HTMLElement => {
+      const tile = document.createElement("img") as OfflineTileElement;
+      const controller = new AbortController();
+      tile._offlineAbort = controller;
+      tile.alt = "";
+      tile.setAttribute("role", "presentation");
+      tile.decoding = "async";
+      const finish = (error?: Error) => {
+        if (tile._offlineDone) return;
+        tile._offlineDone = true;
+        done(error, tile);
+      };
+      const tileBounds = tileBoundsForCoords(coords);
+      if (tileBounds && bounds.contains(tileBounds)) finish();
+      else loadOsmFallbackTile(tile, coords, controller.signal, finish);
+      return tile;
+    };
+
+    const FallbackGridLayer = L.GridLayer.extend({ createTile }) as unknown as new (
+      options: L.GridLayerOptions,
+    ) => L.GridLayer;
+    const layer = new FallbackGridLayer({
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      minZoom: 0,
+      maxZoom: 22,
+      tileSize: 256,
+      noWrap: true,
+    }) as L.GridLayer;
+    layer.on("tileunload", (event: L.TileEvent) => {
+      const tile = event.tile as OfflineTileElement;
+      tile._offlineAbort?.abort();
+      tile.onload = null;
+      tile.onerror = null;
+      tile.removeAttribute("src");
+    });
+    return layer;
+  }
+
+  function createOsmFeatureLayer(packageInfo: OsmOfflineMap): L.Layer {
+    const getTags = (feature: { properties?: Record<string, unknown> }) =>
+      (feature.properties?.tags ?? {}) as Record<string, string>;
+    const styleForTags = (tags: Record<string, string>): L.PathOptions => {
+      if (tags.natural === "water" || tags.water || tags.waterway === "riverbank") {
+        return { color: "#3b82a0", weight: 1.5, fillColor: "#78bfd3", fillOpacity: 0.72 };
+      }
+      if (tags.building && tags.building !== "no") {
+        return { color: "#9b8062", weight: 1, fillColor: "#dfc9a9", fillOpacity: 0.72 };
+      }
+      if (tags.highway) {
+        const major = ["motorway", "trunk", "primary", "secondary"].includes(tags.highway);
+        return { color: major ? "#c57858" : "#8b9298", weight: major ? 3 : 1.8, opacity: 0.92 };
+      }
+      if (tags.railway) return { color: "#6f6578", weight: 2, dashArray: "5 4" };
+      if (tags.leisure || tags.landuse || tags.natural || tags.amenity) {
+        return { color: "#648b62", weight: 1.2, fillColor: "#a9c99a", fillOpacity: 0.58 };
+      }
+      return { color: "#765f9b", weight: 2, fillColor: "#a78acb", fillOpacity: 0.62 };
+    };
+
+    return L.geoJSON(packageInfo.data as never, {
+      style: (feature) => styleForTags(getTags(feature ?? {})),
+      pointToLayer: (feature, latlng) => {
+        const tags = getTags(feature);
+        const marker = L.circleMarker(latlng, {
+          radius: tags.amenity || tags.shop || tags.tourism || tags.place ? 5 : 3.5,
+          ...styleForTags(tags),
+        });
+        const label = tags.name;
+        if (label) marker.bindTooltip(escapeHtml(label), { direction: "top", offset: [0, -4] });
+        return marker;
+      },
+      onEachFeature: (feature, layer) => {
+        const tags = getTags(feature);
+        const label = tags.name || tags.amenity || tags.shop || tags.tourism || tags.highway;
+        if (label) {
+          const category = tags.amenity || tags.shop || tags.tourism || tags.highway || tags.natural || "OpenStreetMap";
+          layer.bindPopup(`<strong>${escapeHtml(label)}</strong><br><small>${escapeHtml(category)}</small>`);
+        }
+      },
+    });
+  }
+
+  function createOsmOfflineLayer(packageInfo: OsmOfflineMap, bounds: L.LatLngBounds): L.Layer {
+    const background = L.rectangle(bounds, {
+      stroke: false,
+      fillColor: "#f8f7f2",
+      fillOpacity: 1,
+      interactive: false,
+    });
+    return L.layerGroup([
+      createOsmRegionFallbackLayer(bounds),
+      background,
+      createOsmFeatureLayer(packageInfo),
+    ]);
+  }
+
   function createPmtilesFallbackLayer(packageInfo: PmtilesOfflineMap): L.Layer {
     const createTile = (coords: L.Coords, done: L.DoneCallback): HTMLElement => {
       const tile = document.createElement("img") as OfflineTileElement;
@@ -273,7 +383,9 @@
     };
 
     let layer: L.Layer;
-    if (packageInfo.kind === "xyz") {
+    if (packageInfo.kind === "osm") {
+      layer = createOsmOfflineLayer(packageInfo, bounds);
+    } else if (packageInfo.kind === "xyz") {
       layer = createXyzOfflineLayer(packageInfo);
     } else if (packageInfo.header.tileType === TileType.Mvt) {
       const localLayer = protomapsLeafletLayer({

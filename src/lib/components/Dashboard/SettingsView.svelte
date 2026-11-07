@@ -419,6 +419,7 @@
             completed: 0,
             total: estimatedRegionTiles,
             storedTiles: 0,
+            reusedTiles: 0,
             downloadedBytes: 0,
         };
         try {
@@ -1186,7 +1187,7 @@
                                 <div class="space-y-1" aria-live="polite">
                                     <progress class="progress progress-primary w-full" value={downloadProgress.completed} max={Math.max(downloadProgress.total, 1)}></progress>
                                     <p class="text-xs text-gray-500">
-                                        {downloadProgress.completed.toLocaleString()} / {downloadProgress.total.toLocaleString()} · {downloadProgress.storedTiles.toLocaleString()} کاشی ذخیره‌شده · {formatBytes(downloadProgress.downloadedBytes)}
+                                        {downloadProgress.completed.toLocaleString()} / {downloadProgress.total.toLocaleString()} · {downloadProgress.storedTiles.toLocaleString()} کاشی تازه ذخیره‌شده · {downloadProgress.reusedTiles.toLocaleString()} کاشی از قبل موجود · {formatBytes(downloadProgress.downloadedBytes)}
                                     </p>
                                 </div>
                             {/if}

@@ -31,6 +31,7 @@ export interface OfflineMapInfo {
   maxLat: number;
   attribution: string;
   providerHost?: string;
+  tileSourceId?: string;
 }
 
 export interface PmtilesOfflineMap {
@@ -72,6 +73,7 @@ export interface RegionDownloadProgress {
   completed: number;
   total: number;
   storedTiles: number;
+  reusedTiles: number;
   downloadedBytes: number;
 }
 
@@ -457,6 +459,43 @@ function tileKey(mapId: string, z: number, x: number, y: number): string {
   return `${mapId}/${z}/${x}/${y}`;
 }
 
+function tileSourceIdFor(template: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < template.length; index += 1) {
+    const code = template.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ code, 0x85ebca6b);
+  }
+  return `${(first >>> 0).toString(16)}-${(second >>> 0).toString(16)}`;
+}
+
+async function listTileKeys(mapId: string): Promise<Set<string>> {
+  const database = await openDatabase();
+  const transaction = database.transaction(TILE_STORE, "readonly");
+  const prefix = `${mapId}/`;
+  const [keys] = await Promise.all([
+    requestResult(
+      transaction.objectStore(TILE_STORE).getAllKeys(
+        IDBKeyRange.bound(prefix, `${prefix}\uffff`),
+      ),
+    ),
+    transactionComplete(transaction),
+  ]);
+  return new Set(keys.map(String));
+}
+
+async function deleteTileEntries(mapId: string, entries: PlannedTile[]): Promise<void> {
+  if (entries.length === 0) return;
+  const database = await openDatabase();
+  const transaction = database.transaction(TILE_STORE, "readwrite");
+  const store = transaction.objectStore(TILE_STORE);
+  for (const entry of entries) {
+    store.delete(tileKey(mapId, entry.z, entry.x, entry.y));
+  }
+  await transactionComplete(transaction);
+}
+
 async function putTileBatch(mapId: string, entries: TileEntry[]): Promise<void> {
   if (entries.length === 0) return;
   const database = await openDatabase();
@@ -695,95 +734,140 @@ export async function downloadRegionTiles(
 ): Promise<XyzOfflineMap> {
   const name = options.name.trim();
   const attribution = options.attribution.trim();
+  const urlTemplate = options.urlTemplate.trim();
   if (!name) throw new Error("برای بسته نقشه یک نام وارد کنید");
   if (!attribution) throw new Error("انتساب منبع نقشه الزامی است");
   if (!options.confirmsOfflinePermission) {
     throw new Error("برای ادامه باید تأیید کنید که منبع اجازه دانلود آفلاین می‌دهد");
   }
-  const { host } = validateTileUrlTemplate(options.urlTemplate.trim());
+  const { host } = validateTileUrlTemplate(urlTemplate);
   const plan = buildTilePlan(options);
-  const id = makeId();
+  const sourceId = tileSourceIdFor(urlTemplate);
   const internalController = new AbortController();
   const abortFromCaller = () => internalController.abort();
   if (signal.aborted) internalController.abort();
   signal.addEventListener("abort", abortFromCaller, { once: true });
 
+  let mapId = "";
+  let existingMap: StoredXyzMap | undefined;
+  let existingTileKeys = new Set<string>();
   let nextIndex = 0;
   let completed = 0;
   let storedTiles = 0;
+  let reusedTiles = 0;
   let downloadedBytes = 0;
   let pendingEntries: TileEntry[] = [];
+  const newlyStoredTiles: PlannedTile[] = [];
   let writeChain = Promise.resolve();
   let writeFailure: unknown = null;
+  let workers: Promise<void>[] = [];
 
-  const queueBatch = (force = false) => {
-    if (pendingEntries.length < 64 && !force) return;
-    const batch = pendingEntries.splice(0);
-    if (batch.length === 0) return;
-    writeChain = writeChain.then(() => putTileBatch(id, batch));
-    void writeChain.catch((error: unknown) => {
-      writeFailure = error;
-      internalController.abort();
-    });
-  };
-
-  const worker = async () => {
-    while (!internalController.signal.aborted) {
-      const index = nextIndex++;
-      if (index >= plan.length) return;
-      const tile = plan[index];
-      const url = options.urlTemplate
-        .trim()
-        .replaceAll("{z}", String(tile.z))
-        .replaceAll("{x}", String(tile.x))
-        .replaceAll("{y}", String(tile.y))
-        .replaceAll("{s}", "a");
-
-      let response: Response;
-      try {
-        response = await fetch(url, { signal: internalController.signal });
-      } catch (error) {
-        if (internalController.signal.aborted) return;
-        throw new Error(
-          `دریافت کاشی ناموفق بود؛ اتصال، CORS و نشانی ارائه‌دهنده را بررسی کنید (${error instanceof Error ? error.message : "network error"})`,
-        );
-      }
-
-      if (
-        response.url &&
-        isOpenStreetMapStandardHost(new URL(response.url).hostname)
-      ) {
-        throw new Error(
-          "دانلود از طریق تغییر مسیر به دامنه استاندارد OpenStreetMap مسدود شد.",
-        );
-      }
-
-      if (response.ok) {
-        const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-        if (contentType && !contentType.startsWith("image/") && !contentType.includes("octet-stream")) {
-          throw new Error("این نشانی کاشی رستری برنمی‌گرداند؛ برای دانلود منطقه، قالب XYZ تصویری لازم است");
-        }
-        const blob = await response.blob();
-        if (blob.size > 0) {
-          pendingEntries.push({ ...tile, blob });
-          storedTiles += 1;
-          downloadedBytes += blob.size;
-        }
-      } else if (response.status !== 404 && response.status !== 410) {
-        if (response.status === 429) {
-          throw new Error("ارائه‌دهنده درخواست‌ها را محدود کرد (HTTP 429). دانلود متوقف شد؛ شرایط و نرخ مجاز را بررسی کنید.");
-        }
-        throw new Error(`دریافت کاشی ناموفق بود (HTTP ${response.status})`);
-      }
-
-      completed += 1;
-      onProgress({ completed, total: plan.length, storedTiles, downloadedBytes });
-      queueBatch();
-    }
-  };
-
-  const workers = Array.from({ length: Math.min(2, plan.length) }, () => worker());
   try {
+    if (internalController.signal.aborted) {
+      throw new DOMException("Download cancelled", "AbortError");
+    }
+
+    existingMap = (await listMapRecords()).find(
+      (record): record is StoredXyzMap =>
+        record.kind === "xyz" && record.info.tileSourceId === sourceId,
+    );
+    mapId = existingMap?.id ?? makeId();
+    if (existingMap) existingTileKeys = await listTileKeys(mapId);
+    const additionalTiles = plan.reduce(
+      (count, tile) =>
+        count + (existingTileKeys.has(tileKey(mapId, tile.z, tile.x, tile.y)) ? 0 : 1),
+      0,
+    );
+    if ((existingMap?.info.tileCount ?? 0) + additionalTiles > MAX_REGION_TILE_COUNT) {
+      throw new Error(
+        `با افزودن این محدوده، بسته از سقف ${MAX_REGION_TILE_COUNT.toLocaleString()} کاشی عبور می‌کند؛ محدوده را کوچک‌تر کنید یا بیشترین زوم را کاهش دهید.`,
+      );
+    }
+
+    const reportProgress = () =>
+      onProgress({
+        completed,
+        total: plan.length,
+        storedTiles,
+        reusedTiles,
+        downloadedBytes,
+      });
+
+    const queueBatch = (force = false) => {
+      if (pendingEntries.length < 64 && !force) return;
+      const batch = pendingEntries.splice(0);
+      if (batch.length === 0) return;
+      writeChain = writeChain.then(() => putTileBatch(mapId, batch));
+      void writeChain.catch((error: unknown) => {
+        writeFailure = error;
+        internalController.abort();
+      });
+    };
+
+    const worker = async () => {
+      while (!internalController.signal.aborted) {
+        const index = nextIndex++;
+        if (index >= plan.length) return;
+        const tile = plan[index];
+        const key = tileKey(mapId, tile.z, tile.x, tile.y);
+        if (existingTileKeys.has(key)) {
+          reusedTiles += 1;
+          completed += 1;
+          reportProgress();
+          continue;
+        }
+
+        const url = urlTemplate
+          .replaceAll("{z}", String(tile.z))
+          .replaceAll("{x}", String(tile.x))
+          .replaceAll("{y}", String(tile.y))
+          .replaceAll("{s}", "a");
+
+        let response: Response;
+        try {
+          response = await fetch(url, { signal: internalController.signal });
+        } catch (error) {
+          if (internalController.signal.aborted) return;
+          throw new Error(
+            `دریافت کاشی ناموفق بود؛ اتصال، CORS و نشانی ارائه‌دهنده را بررسی کنید (${error instanceof Error ? error.message : "network error"})`,
+          );
+        }
+
+        if (
+          response.url &&
+          isOpenStreetMapStandardHost(new URL(response.url).hostname)
+        ) {
+          throw new Error(
+            "دانلود از طریق تغییر مسیر به دامنه استاندارد OpenStreetMap مسدود شد.",
+          );
+        }
+
+        if (response.ok) {
+          const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+          if (contentType && !contentType.startsWith("image/") && !contentType.includes("octet-stream")) {
+            throw new Error("این نشانی کاشی رستری برنمی‌گرداند؛ برای دانلود منطقه، قالب XYZ تصویری لازم است");
+          }
+          const blob = await response.blob();
+          if (blob.size > 0) {
+            pendingEntries.push({ ...tile, blob });
+            newlyStoredTiles.push(tile);
+            storedTiles += 1;
+            downloadedBytes += blob.size;
+          }
+        } else if (response.status !== 404 && response.status !== 410) {
+          if (response.status === 429) {
+            throw new Error("ارائه‌دهنده درخواست‌ها را محدود کرد (HTTP 429). دانلود متوقف شد؛ شرایط و نرخ مجاز را بررسی کنید.");
+          }
+          throw new Error(`دریافت کاشی ناموفق بود (HTTP ${response.status})`);
+        }
+
+        completed += 1;
+        reportProgress();
+        queueBatch();
+      }
+    };
+
+    workers = Array.from({ length: Math.min(2, plan.length) }, () => worker());
     await Promise.all(workers);
     if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
     if (writeFailure) throw writeFailure;
@@ -791,45 +875,53 @@ export async function downloadRegionTiles(
     queueBatch(true);
     await writeChain;
     if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
-    if (storedTiles === 0) throw new Error("در این محدوده هیچ کاشی تصویری از ارائه‌دهنده دریافت نشد");
+    if (storedTiles + reusedTiles === 0) {
+      throw new Error("در این محدوده هیچ کاشی تصویری از ارائه‌دهنده دریافت نشد");
+    }
 
+    const previous = existingMap?.info;
+    const tileCount = (previous?.tileCount ?? 0) + storedTiles;
     const info: OfflineMapInfo = {
-      id,
+      id: mapId,
       kind: "xyz",
       name,
-      fileName: `${name} (${storedTiles.toLocaleString()} tiles)`,
-      sizeBytes: downloadedBytes,
-      tileCount: storedTiles,
+      fileName: `${name} (${tileCount.toLocaleString()} tiles)`,
+      sizeBytes: (previous?.sizeBytes ?? 0) + downloadedBytes,
+      tileCount,
       tileKind: "raster",
-      minZoom: options.minZoom,
-      maxZoom: options.maxZoom,
-      minLon: options.west,
-      minLat: options.south,
-      maxLon: options.east,
-      maxLat: options.north,
+      minZoom: Math.min(previous?.minZoom ?? options.minZoom, options.minZoom),
+      maxZoom: Math.max(previous?.maxZoom ?? options.maxZoom, options.maxZoom),
+      minLon: Math.min(previous?.minLon ?? options.west, options.west),
+      minLat: Math.min(previous?.minLat ?? options.south, options.south),
+      maxLon: Math.max(previous?.maxLon ?? options.east, options.east),
+      maxLat: Math.max(previous?.maxLat ?? options.north, options.north),
       attribution,
       providerHost: host,
+      tileSourceId: sourceId,
     };
-    const record: StoredXyzMap = { id, kind: "xyz", info };
+    const record: StoredXyzMap = { id: mapId, kind: "xyz", info };
     const database = await openDatabase();
     if (signal.aborted) throw new DOMException("Download cancelled", "AbortError");
     const transaction = database.transaction([MAP_STORE, PREFERENCE_STORE], "readwrite");
-    transaction.objectStore(MAP_STORE).put(record, id);
-    transaction.objectStore(PREFERENCE_STORE).put(id, ACTIVE_MAP_KEY);
+    transaction.objectStore(MAP_STORE).put(record, mapId);
+    transaction.objectStore(PREFERENCE_STORE).put(mapId, ACTIVE_MAP_KEY);
     await transactionComplete(transaction);
 
-    offlineMaps.update((maps) => [info, ...maps]);
+    offlineMaps.update((maps) => [info, ...maps.filter((item) => item.id !== mapId)]);
     const savedPackage: XyzOfflineMap = { kind: "xyz", info };
     offlineMap.set(savedPackage);
     loadPromise = Promise.resolve(savedPackage);
-    onProgress({ completed: plan.length, total: plan.length, storedTiles, downloadedBytes });
+    reportProgress();
     return savedPackage;
   } catch (error) {
     internalController.abort();
     await Promise.allSettled(workers);
     await writeChain.catch(() => undefined);
     try {
-      await deleteTilePack(id);
+      if (mapId) {
+        if (existingMap) await deleteTileEntries(mapId, newlyStoredTiles);
+        else await deleteTilePack(mapId);
+      }
     } catch {
       // Preserve the original error if cleanup itself fails.
     }

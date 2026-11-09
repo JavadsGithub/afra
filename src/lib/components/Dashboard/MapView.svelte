@@ -9,7 +9,6 @@
     type Marker as MapLibreMarker,
     type StyleSpecification,
   } from "maplibre-gl";
-  import "maplibre-gl/dist/maplibre-gl.css";
   import { layers as protomapsLayers, namedFlavor } from "@protomaps/basemaps";
   import { Protocol, TileType } from "pmtiles";
   import { onMount } from "svelte";

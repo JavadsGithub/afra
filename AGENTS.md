@@ -15,7 +15,7 @@ pnpm check             # Type check (svelte-kit sync && svelte-check)
 **Stack**: Tauri 2 + SvelteKit 5 + TypeScript + Rust (edition 2021)
 **Package manager**: pnpm
 **Styling**: TailwindCSS v4 + DaisyUI v5
-**Map**: Leaflet
+**Map**: MapLibre GL JS with local PMTiles archives; no online map services
 **UI icons**: lucide-svelte
 **Language**: Persian (fa), RTL layout
 

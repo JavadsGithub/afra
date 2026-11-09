@@ -1,19 +1,24 @@
 <script lang="ts">
-  import * as L from "leaflet";
-  import "leaflet/dist/leaflet.css";
-  import { leafletRasterLayer, TileType } from "pmtiles";
-  import { leafletLayer as protomapsLeafletLayer } from "protomaps-leaflet";
+  import {
+    addProtocol,
+    Map as MapLibreMapClass,
+    Marker as MapLibreMarkerClass,
+    removeProtocol,
+    type Map as MapLibreMap,
+    type MapMouseEvent,
+    type Marker as MapLibreMarker,
+    type StyleSpecification,
+  } from "maplibre-gl";
+  import "maplibre-gl/dist/maplibre-gl.css";
+  import { layers as protomapsLayers, namedFlavor } from "@protomaps/basemaps";
+  import { Protocol, TileType } from "pmtiles";
   import { onMount } from "svelte";
   import {
-    loadOfflineTile,
     loadSavedOfflineMaps,
     offlineMap,
     type OfflineMapPackage,
-    type OsmOfflineMap,
     type PmtilesOfflineMap,
-    type XyzOfflineMap,
   } from "$lib/services/offline-maps";
-  // Import pin service instead of store
   import {
     type Pin,
     addPin,
@@ -21,7 +26,6 @@
     loadPins,
     updatePin,
   } from "$lib/services/pins";
-  // Import command service functions
   import { scanPorts } from "$lib/services/ports";
   import { mapActions } from "$lib/stores/map-actions";
   import { settings, isPortConnected, updateMode } from "$lib/stores/settings";
@@ -29,35 +33,30 @@
   import { ChevronDown, Copy, Navigation2 as Navigation } from "lucide-svelte";
   import { sendPins } from "$lib/services/transmitter";
   import { connectionStatus } from "$lib/stores/settings";
-  import icon from "leaflet/dist/images/marker-icon.png";
-  import iconShadow from "leaflet/dist/images/marker-shadow.png";
   import { get } from "svelte/store";
 
-  const OSM_TILE_URL_TEMPLATE = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
-
-  type LeafletMap = L.Map;
-  type OfflineTileElement = HTMLImageElement & {
-    _offlineAbort?: AbortController;
-    _offlineObjectUrl?: string;
-    _offlineDone?: boolean;
+  const EMPTY_MAP_STYLE: StyleSpecification = {
+    version: 8,
+    sources: {},
+    layers: [{
+      id: "offline-background",
+      type: "background",
+      paint: { "background-color": "#e8e7e2" },
+    }],
   };
 
   let mapContainer: HTMLDivElement;
-  let map: LeafletMap;
-  let onlineBaseLayer: L.TileLayer;
-  let offlineBaseLayer: L.Layer | null = null;
+  let map: MapLibreMap | null = null;
+  let pmtilesProtocol: Protocol | null = null;
   let unsubscribeOfflineMap: (() => void) | null = null;
+  let pinMarkers = new Map<number, MapLibreMarker>();
+  let locationMarker: MapLibreMarker | null = null;
   let currentPosition = $state({ lat: 35.6895, lng: 51.389 });
   let coordinates = $state("0, 0");
 
-  // Backend pins state
   let backendPins = $state<Pin[]>([]);
-
-  // Map layers state
   let routesLayer = $state(false);
   let objectsLayer = $state(true);
-
-  // Context menu state
   let showContextMenu = $state(false);
   let contextMenuPosition = $state({ x: 0, y: 0 });
   let contextMenuLatLng = $state({ lat: 0, lng: 0 });
@@ -105,450 +104,190 @@
     });
   }
 
-  function loadOsmFallbackTile(
-    tile: OfflineTileElement,
-    coords: L.Coords,
-    signal: AbortSignal,
-    finish: (error?: Error) => void,
-  ): void {
-    if (signal.aborted) return;
-    if (coords.z > 19) {
-      finish();
-      return;
+  function rasterTileExtension(tileType: TileType): string {
+    switch (tileType) {
+      case TileType.Png:
+        return ".png";
+      case TileType.Jpeg:
+        return ".jpg";
+      case TileType.Webp:
+        return ".webp";
+      case TileType.Avif:
+        return ".avif";
+      default:
+        return "";
     }
-    tile.onload = () => finish();
-    tile.onerror = () => finish();
-    tile.src = L.Util.template(OSM_TILE_URL_TEMPLATE, {
-      s: "a",
-      z: String(coords.z),
-      x: String(coords.x),
-      y: String(coords.y),
-    });
   }
 
-  function createXyzOfflineLayer(packageInfo: XyzOfflineMap): L.Layer {
-    const createTile = (coords: L.Coords, done: L.DoneCallback): HTMLElement => {
-      const tile = document.createElement("img") as OfflineTileElement;
-      const controller = new AbortController();
-      tile._offlineAbort = controller;
-      tile.alt = "";
-      tile.setAttribute("role", "presentation");
-      tile.decoding = "async";
+  function offlineStyleFor(packageInfo: PmtilesOfflineMap): StyleSpecification {
+    const sourceId = "local-basemap";
+    const sourceKey = `afra-local/${packageInfo.info.id}`;
+    const attribution = escapeHtml(packageInfo.info.attribution);
+    const bounds: [number, number, number, number] = [
+      packageInfo.info.minLon,
+      packageInfo.info.minLat,
+      packageInfo.info.maxLon,
+      packageInfo.info.maxLat,
+    ];
 
-      const finish = (error?: Error) => {
-        if (tile._offlineDone) return;
-        tile._offlineDone = true;
-        done(error, tile);
+    if (packageInfo.info.tileKind === "raster") {
+      return {
+        version: 8,
+        sources: {
+          [sourceId]: {
+            type: "raster",
+            tiles: [
+              `pmtiles://${sourceKey}/{z}/{x}/{y}${rasterTileExtension(packageInfo.header.tileType)}`,
+            ],
+            tileSize: 256,
+            minzoom: packageInfo.info.minZoom,
+            maxzoom: packageInfo.info.maxZoom,
+            bounds,
+            attribution,
+          },
+        },
+        layers: [
+          {
+            id: "offline-background",
+            type: "background",
+            paint: { "background-color": "#e8e7e2" },
+          },
+          {
+            id: "offline-raster",
+            type: "raster",
+            source: sourceId,
+            paint: { "raster-fade-duration": 0 },
+          },
+        ],
       };
-      const cleanup = () => {
-        tile.onload = null;
-        tile.onerror = null;
-        if (tile._offlineObjectUrl) {
-          URL.revokeObjectURL(tile._offlineObjectUrl);
-          tile._offlineObjectUrl = undefined;
-        }
-      };
-      void loadOfflineTile(packageInfo.info.id, coords.z, coords.x, coords.y)
-        .then((blob) => {
-          if (controller.signal.aborted) return;
-          if (!blob) {
-            loadOsmFallbackTile(tile, coords, controller.signal, finish);
-            return;
-          }
-
-          tile._offlineObjectUrl = URL.createObjectURL(blob);
-          tile.onload = () => finish();
-          tile.onerror = () => {
-            cleanup();
-            loadOsmFallbackTile(tile, coords, controller.signal, finish);
-          };
-          tile.src = tile._offlineObjectUrl;
-        })
-        .catch(() => loadOsmFallbackTile(tile, coords, controller.signal, finish));
-
-      return tile;
-    };
-
-    const OfflineGridLayer = L.GridLayer.extend({ createTile }) as unknown as new (
-      options: L.GridLayerOptions,
-    ) => L.GridLayer;
-    const layer = new OfflineGridLayer({
-      attribution: `${escapeHtml(packageInfo.info.attribution)} · &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors`,
-      minZoom: 0,
-      maxZoom: 22,
-      tileSize: 256,
-      noWrap: true,
-    }) as L.GridLayer;
-
-    layer.on("tileunload", (event: L.TileEvent) => {
-      const tile = event.tile as OfflineTileElement;
-      tile._offlineAbort?.abort();
-      tile.onload = null;
-      tile.onerror = null;
-      tile.removeAttribute("src");
-      if (tile._offlineObjectUrl) {
-        URL.revokeObjectURL(tile._offlineObjectUrl);
-        tile._offlineObjectUrl = undefined;
-      }
-    });
-    return layer;
-  }
-
-  function tileBoundsForCoords(coords: L.Coords): L.LatLngBounds | null {
-    const count = 2 ** coords.z;
-    if (coords.x < 0 || coords.x >= count || coords.y < 0 || coords.y >= count) return null;
-    const longitude = (x: number) => (x / count) * 360 - 180;
-    const latitude = (y: number) =>
-      (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / count))) * 180) / Math.PI;
-    return L.latLngBounds(
-      [latitude(coords.y), longitude(coords.x)],
-      [latitude(coords.y + 1), longitude(coords.x + 1)],
-    );
-  }
-
-  function createOsmRegionFallbackLayer(bounds: L.LatLngBounds): L.Layer {
-    const createTile = (coords: L.Coords, done: L.DoneCallback): HTMLElement => {
-      const tile = document.createElement("img") as OfflineTileElement;
-      const controller = new AbortController();
-      tile._offlineAbort = controller;
-      tile.alt = "";
-      tile.setAttribute("role", "presentation");
-      tile.decoding = "async";
-      const finish = (error?: Error) => {
-        if (tile._offlineDone) return;
-        tile._offlineDone = true;
-        done(error, tile);
-      };
-      const tileBounds = tileBoundsForCoords(coords);
-      if (tileBounds && bounds.contains(tileBounds)) finish();
-      else loadOsmFallbackTile(tile, coords, controller.signal, finish);
-      return tile;
-    };
-
-    const FallbackGridLayer = L.GridLayer.extend({ createTile }) as unknown as new (
-      options: L.GridLayerOptions,
-    ) => L.GridLayer;
-    const layer = new FallbackGridLayer({
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-      minZoom: 0,
-      maxZoom: 22,
-      tileSize: 256,
-      noWrap: true,
-    }) as L.GridLayer;
-    layer.on("tileunload", (event: L.TileEvent) => {
-      const tile = event.tile as OfflineTileElement;
-      tile._offlineAbort?.abort();
-      tile.onload = null;
-      tile.onerror = null;
-      tile.removeAttribute("src");
-    });
-    return layer;
-  }
-
-  function createOsmFeatureLayer(packageInfo: OsmOfflineMap): L.Layer {
-    const getTags = (feature: { properties?: Record<string, unknown> }) =>
-      (feature.properties?.tags ?? {}) as Record<string, string>;
-    const styleForTags = (tags: Record<string, string>): L.PathOptions => {
-      if (tags.natural === "water" || tags.water || tags.waterway === "riverbank") {
-        return { color: "#3b82a0", weight: 1.5, fillColor: "#78bfd3", fillOpacity: 0.72 };
-      }
-      if (tags.building && tags.building !== "no") {
-        return { color: "#9b8062", weight: 1, fillColor: "#dfc9a9", fillOpacity: 0.72 };
-      }
-      if (tags.highway) {
-        const major = ["motorway", "trunk", "primary", "secondary"].includes(tags.highway);
-        return { color: major ? "#c57858" : "#8b9298", weight: major ? 3 : 1.8, opacity: 0.92 };
-      }
-      if (tags.railway) return { color: "#6f6578", weight: 2, dashArray: "5 4" };
-      if (tags.leisure || tags.landuse || tags.natural || tags.amenity) {
-        return { color: "#648b62", weight: 1.2, fillColor: "#a9c99a", fillOpacity: 0.58 };
-      }
-      return { color: "#765f9b", weight: 2, fillColor: "#a78acb", fillOpacity: 0.62 };
-    };
-
-    return L.geoJSON(packageInfo.data as never, {
-      style: (feature) => styleForTags(getTags(feature ?? {})),
-      pointToLayer: (feature, latlng) => {
-        const tags = getTags(feature);
-        const marker = L.circleMarker(latlng, {
-          radius: tags.amenity || tags.shop || tags.tourism || tags.place ? 5 : 3.5,
-          ...styleForTags(tags),
-        });
-        const label = tags.name;
-        if (label) marker.bindTooltip(escapeHtml(label), { direction: "top", offset: [0, -4] });
-        return marker;
-      },
-      onEachFeature: (feature, layer) => {
-        const tags = getTags(feature);
-        const label = tags.name || tags.amenity || tags.shop || tags.tourism || tags.highway;
-        if (label) {
-          const category = tags.amenity || tags.shop || tags.tourism || tags.highway || tags.natural || "OpenStreetMap";
-          layer.bindPopup(`<strong>${escapeHtml(label)}</strong><br><small>${escapeHtml(category)}</small>`);
-        }
-      },
-    });
-  }
-
-  function createOsmOfflineLayer(packageInfo: OsmOfflineMap, bounds: L.LatLngBounds): L.Layer {
-    const background = L.rectangle(bounds, {
-      stroke: false,
-      fillColor: "#f8f7f2",
-      fillOpacity: 1,
-      interactive: false,
-    });
-    return L.layerGroup([
-      createOsmRegionFallbackLayer(bounds),
-      background,
-      createOsmFeatureLayer(packageInfo),
-    ]);
-  }
-
-  function createPmtilesFallbackLayer(packageInfo: PmtilesOfflineMap): L.Layer {
-    const createTile = (coords: L.Coords, done: L.DoneCallback): HTMLElement => {
-      const tile = document.createElement("img") as OfflineTileElement;
-      const controller = new AbortController();
-      tile._offlineAbort = controller;
-      tile.alt = "";
-      tile.setAttribute("role", "presentation");
-      tile.decoding = "async";
-
-      let isDone = false;
-      const finish = (error?: Error) => {
-        if (isDone) return;
-        isDone = true;
-        done(error, tile);
-      };
-      const useOsmFallback = () =>
-        loadOsmFallbackTile(tile, coords, controller.signal, finish);
-
-      void packageInfo.pmtiles
-        .getZxy(coords.z, coords.x, coords.y, controller.signal)
-        .then((cachedTile) => {
-          if (controller.signal.aborted) return;
-          if (cachedTile) finish();
-          else useOsmFallback();
-        })
-        .catch(useOsmFallback);
-
-      return tile;
-    };
-
-    const FallbackGridLayer = L.GridLayer.extend({ createTile }) as unknown as new (
-      options: L.GridLayerOptions,
-    ) => L.GridLayer;
-    const layer = new FallbackGridLayer({
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-      minZoom: 0,
-      maxZoom: 22,
-      tileSize: 256,
-      noWrap: true,
-    }) as L.GridLayer;
-
-    layer.on("tileunload", (event: L.TileEvent) => {
-      const tile = event.tile as OfflineTileElement;
-      tile._offlineAbort?.abort();
-      tile.onload = null;
-      tile.onerror = null;
-      tile.removeAttribute("src");
-    });
-    return layer;
-  }
-
-  function syncOfflineBaseLayer(packageInfo: OfflineMapPackage | null): void {
-    if (!map || !onlineBaseLayer) return;
-
-    if (offlineBaseLayer) {
-      if (map.hasLayer(offlineBaseLayer)) map.removeLayer(offlineBaseLayer);
-      offlineBaseLayer = null;
     }
 
+    return {
+      version: 8,
+      sources: {
+        [sourceId]: {
+          type: "vector",
+          url: `pmtiles://${sourceKey}`,
+          bounds,
+          attribution,
+        },
+      },
+      // The no-label Protomaps style uses no remote glyphs, sprites, or other assets.
+      layers: protomapsLayers(sourceId, namedFlavor("light")) as unknown as StyleSpecification["layers"],
+    };
+  }
+
+  function syncOfflineMap(packageInfo: OfflineMapPackage | null): void {
+    if (!map) return;
     if (!packageInfo) {
-      if (!map.hasLayer(onlineBaseLayer)) onlineBaseLayer.addTo(map);
+      map.setStyle(EMPTY_MAP_STYLE);
       return;
     }
 
-    if (map.hasLayer(onlineBaseLayer)) map.removeLayer(onlineBaseLayer);
-
+    pmtilesProtocol?.add(packageInfo.pmtiles);
+    map.setStyle(offlineStyleFor(packageInfo));
     const info = packageInfo.info;
-    const bounds = L.latLngBounds(
-      [info.minLat, info.minLon],
-      [info.maxLat, info.maxLon],
-    );
-    const tileOptions = {
-      attribution: escapeHtml(info.attribution),
-      minZoom: info.minZoom,
-      maxZoom: info.maxZoom,
-      bounds: bounds.isValid() ? bounds : undefined,
-      noWrap: true,
-    };
-
-    let layer: L.Layer;
-    if (packageInfo.kind === "osm") {
-      layer = createOsmOfflineLayer(packageInfo, bounds);
-    } else if (packageInfo.kind === "xyz") {
-      layer = createXyzOfflineLayer(packageInfo);
-    } else if (packageInfo.header.tileType === TileType.Mvt) {
-      const localLayer = protomapsLeafletLayer({
-        ...tileOptions,
-        url: packageInfo.pmtiles,
-        flavor: "light",
-        lang: "fa",
-        maxDataZoom: packageInfo.header.maxZoom,
-      }) as unknown as L.Layer;
-      layer = L.layerGroup([createPmtilesFallbackLayer(packageInfo), localLayer]);
-    } else {
-      const localLayer = leafletRasterLayer(packageInfo.pmtiles, tileOptions) as L.Layer;
-      localLayer.on("tileunload", (event: L.TileEvent) => {
-        const sourceUrl = event.tile.currentSrc || event.tile.src;
-        if (sourceUrl.startsWith("blob:")) URL.revokeObjectURL(sourceUrl);
-      });
-      layer = L.layerGroup([createPmtilesFallbackLayer(packageInfo), localLayer]);
-    }
-
-    offlineBaseLayer = layer;
-    layer.addTo(map);
-    if (bounds.isValid()) {
-      map.fitBounds(bounds, {
-        padding: [24, 24],
-        maxZoom: Math.min(13, info.maxZoom),
-      });
+    if (
+      [info.minLon, info.minLat, info.maxLon, info.maxLat].every(Number.isFinite) &&
+      info.minLon < info.maxLon &&
+      info.minLat < info.maxLat
+    ) {
+      map.fitBounds(
+        [[info.minLon, info.minLat], [info.maxLon, info.maxLat]],
+        { padding: 24, maxZoom: Math.min(13, info.maxZoom), duration: 0 },
+      );
     }
   }
 
-  // Initialize the map when the component mounts
+  function updateMarkersOnMap(): void {
+    if (!map) return;
+    for (const marker of pinMarkers.values()) marker.remove();
+    pinMarkers.clear();
+
+    for (const pin of backendPins) {
+      const marker = new MapLibreMarkerClass({ color: "#dc2626" })
+        .setLngLat([pin.lng, pin.lat])
+        .addTo(map);
+      marker.getElement().addEventListener("click", (event: MouseEvent) => {
+        event.stopPropagation();
+        onPinSelected(pin);
+      });
+      pinMarkers.set(pin.id, marker);
+    }
+  }
+
   onMount(() => {
     let isDisposed = false;
+    pmtilesProtocol = new Protocol({ metadata: false });
+    addProtocol("pmtiles", pmtilesProtocol.tile);
 
-    // Leaflet-based PMTiles adapters expect the Leaflet namespace on the global object.
-    (globalThis as typeof globalThis & { L?: typeof L }).L = L;
+    const mapInstance = new MapLibreMapClass({
+      container: mapContainer,
+      style: EMPTY_MAP_STYLE,
+      center: [currentPosition.lng, currentPosition.lat],
+      zoom: 13,
+      maxZoom: 22,
+    });
+    map = mapInstance;
 
-    // Fix for default marker icons in Leaflet with Vite
-    // @ts-ignore: _getIconUrl property exists but is not typed
-    delete L.Icon.Default.prototype._getIconUrl;
-    L.Icon.Default.mergeOptions({
-      iconUrl: icon,
-      iconRetinaUrl: icon,
-      shadowUrl: iconShadow,
+    mapInstance.on("click", (event: MapMouseEvent) => {
+      currentPosition = { lat: event.lngLat.lat, lng: event.lngLat.lng };
+      coordinates = `${event.lngLat.lat.toFixed(6)}, ${event.lngLat.lng.toFixed(6)}`;
+      showContextMenu = false;
     });
 
-    // Initialize the map
-    map = L.map(mapContainer).setView(
-      [currentPosition.lat, currentPosition.lng],
-      13,
-    );
-
-    // Use OSM when no offline map is saved; installed tiles take priority automatically.
-    onlineBaseLayer = L.tileLayer(
-      OSM_TILE_URL_TEMPLATE,
-      {
-        attribution:
-          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-        maxZoom: 19,
-      },
-    );
-
-    const subscribeToOfflineMap = () => {
-      if (isDisposed || !map) return;
-      unsubscribeOfflineMap = offlineMap.subscribe(syncOfflineBaseLayer);
-    };
-    void loadSavedOfflineMaps()
-      .then(subscribeToOfflineMap)
-      .catch((error) => {
-        console.error("Error loading offline map package:", error);
-        // If local storage is unavailable or the saved pack is invalid, keep
-        // the online map usable instead of leaving the basemap empty.
-        subscribeToOfflineMap();
-      });
-
-    // Load pins from backend
-    loadPins()
-      .then((pins) => {
-        backendPins = pins;
-        updateMarkersOnMap();
-      })
-      .catch((error) => {
-        console.error("Error loading pins:", error);
-      });
-
-    // Listen for robot data received events
-
-    // Add click event to get coordinates
-    map.on("click", (e: any) => {
-      currentPosition = { lat: e.latlng.lat, lng: e.latlng.lng };
-      coordinates = `${e.latlng.lat.toFixed(6)}, ${e.latlng.lng.toFixed(6)}`;
-    });
-
-    // Add right-click event to show context menu
-    map.on("contextmenu", (e: any) => {
-      // Prevent the default browser context menu
-      const event = e.originalEvent;
-      event.preventDefault();
-
-      // Calculate the position for the context menu (position to the bottom-right of cursor)
+    mapInstance.on("contextmenu", (event: MapMouseEvent) => {
+      const nativeEvent = event.originalEvent;
+      nativeEvent.preventDefault();
       const mapBounds = mapContainer.getBoundingClientRect();
-      let x = event.clientX - mapBounds.left;
-      let y = event.clientY - mapBounds.top;
-
+      let x = nativeEvent.clientX - mapBounds.left;
+      let y = nativeEvent.clientY - mapBounds.top;
       const menuWidth = 150;
       const menuHeight = 40;
-
-      if (x + menuWidth > mapBounds.width) {
-        x = Math.max(0, event.clientX - mapBounds.left - menuWidth);
-      }
-
-      if (y + menuHeight > mapBounds.height) {
-        y = Math.max(0, event.clientY - mapBounds.top - menuHeight);
-      }
+      if (x + menuWidth > mapBounds.width) x = Math.max(0, x - menuWidth);
+      if (y + menuHeight > mapBounds.height) y = Math.max(0, y - menuHeight);
 
       contextMenuPosition = { x, y };
-      contextMenuLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
-
-      // Check if we're right-clicking on an existing pin
-      contextMenuPinId = null; // Reset the pin ID
-      const clickedLat = e.latlng.lat;
-      const clickedLng = e.latlng.lng;
-
-      // Iterate through all pins to see if any are at this location (with a small tolerance)
+      contextMenuLatLng = { lat: event.lngLat.lat, lng: event.lngLat.lng };
+      contextMenuPinId = null;
       for (const pin of backendPins) {
-        // Check if the click is close to an existing pin (within 0.0001 degrees ~ 11 meters)
         if (
-          Math.abs(pin.lat - clickedLat) < 0.0001 &&
-          Math.abs(pin.lng - clickedLng) < 0.0001
+          Math.abs(pin.lat - event.lngLat.lat) < 0.0001 &&
+          Math.abs(pin.lng - event.lngLat.lng) < 0.0001
         ) {
           contextMenuPinId = pin.id;
           break;
         }
       }
-
-      // Show the context menu
       showContextMenu = true;
     });
 
-    // Close context menu when clicking elsewhere on the map
-    map.on("click", () => {
-      showContextMenu = false;
-    });
-
-    // Watch for zoom/pan changes to update the coordinate display
-    map.on("moveend", () => {
-      const center = map.getCenter();
+    mapInstance.on("moveend", () => {
+      const center = mapInstance.getCenter();
       coordinates = `${center.lat.toFixed(6)}, ${center.lng.toFixed(6)}`;
     });
 
-    // Add event listener to close context menu when clicking outside the map
-    const handleOutsideClick = (e: Event) => {
-      if (
-        showContextMenu &&
-        mapContainer &&
-        !mapContainer.contains(e.target as Node)
-      ) {
+    const handleOutsideClick = (event: Event) => {
+      if (showContextMenu && !mapContainer.contains(event.target as Node)) {
         showContextMenu = false;
       }
     };
-
     document.addEventListener("click", handleOutsideClick);
 
-    // Auto-detect serial port if none configured
+    unsubscribeOfflineMap = offlineMap.subscribe(syncOfflineMap);
+    void loadSavedOfflineMaps().catch((error) => {
+      // There is deliberately no network fallback if local map data is unavailable.
+      console.error("Could not load local PMTiles map:", error);
+    });
+
+    loadPins()
+      .then((pins) => {
+        if (isDisposed) return;
+        backendPins = pins;
+        updateMarkersOnMap();
+      })
+      .catch((error) => console.error("Error loading pins:", error));
+
     if (!$settings.port) {
       scanPorts()
         .then((ports) => {
@@ -560,77 +299,50 @@
         .catch(() => {});
     }
 
-    // Cleanup function
     return () => {
       isDisposed = true;
       unsubscribeOfflineMap?.();
       unsubscribeOfflineMap = null;
       document.removeEventListener("click", handleOutsideClick);
-      if (map) {
-        map.remove();
-      }
+      for (const marker of pinMarkers.values()) marker.remove();
+      pinMarkers.clear();
+      locationMarker?.remove();
+      locationMarker = null;
+      map?.remove();
+      map = null;
+      removeProtocol("pmtiles");
+      pmtilesProtocol?.tiles.clear();
+      pmtilesProtocol = null;
     };
   });
 
-  // Function to update markers on the map based on backend pins
-  function updateMarkersOnMap(): void {
-    // This implementation will clear existing markers and add new ones from backendPins
-    // In a real implementation, you would want to optimize this to only add/remove changed markers
-    map.eachLayer((layer) => {
-      if (layer instanceof L.Marker) {
-        map.removeLayer(layer);
-      }
-    });
-
-    // Add markers for all backend pins
-    backendPins.forEach((pin) => {
-      const marker = L.marker([pin.lat, pin.lng]).addTo(map);
-      // Add click event to open pin details modal
-      marker.on("click", () => {
-        onPinSelected(pin);
-      });
-    });
-  }
-
   // Handle layer toggles
-
   $effect(() => {
-    if (map && routesLayer) {
-      console.log("Routes layer enabled");
-    }
+    if (map && routesLayer) console.log("Routes layer enabled");
   });
 
   $effect(() => {
-    if (map && objectsLayer) {
-      console.log("Objects layer enabled");
-    }
+    if (map && objectsLayer) console.log("Objects layer enabled");
   });
 
-  // Map control functions
   function zoomIn(): void {
-    if (map) map.zoomIn();
+    map?.zoomIn();
   }
 
   function zoomOut(): void {
-    if (map) map.zoomOut();
-  }
-
-  function searchLocation(): void {
-    // Basic implementation - you can expand this
-    alert("جستجوی مکان");
+    map?.zoomOut();
   }
 
   function markLocation(): void {
-    if (map && currentPosition) {
-      const marker = L.marker([currentPosition.lat, currentPosition.lng]).addTo(
-        map,
-      );
-      map.setView([currentPosition.lat, currentPosition.lng], 15);
-    }
+    if (!map) return;
+    locationMarker?.remove();
+    locationMarker = new MapLibreMarkerClass({ color: "#2563eb" })
+      .setLngLat([currentPosition.lng, currentPosition.lat])
+      .addTo(map);
+    map.easeTo({ center: [currentPosition.lng, currentPosition.lat], zoom: 15 });
   }
 
   function measureDistance(): void {
-    // Basic implementation - you can expand this
     alert("اندازه گیری فاصله");
   }
 
@@ -724,13 +436,6 @@
   // Function to close context menu
   function closeContextMenu(): void {
     showContextMenu = false;
-  }
-
-  // Cleanup function
-  function destroyMap(): void {
-    if (map) {
-      map.remove();
-    }
   }
 
   // Sync map actions with sidebar store
@@ -1383,10 +1088,3 @@
     </div>
   {/if}
 </div>
-
-<style>
-  :global(.leaflet-grab),
-  :global(.leaflet-container) {
-    cursor: default !important;
-  }
-</style>

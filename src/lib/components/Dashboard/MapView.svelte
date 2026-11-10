@@ -33,7 +33,7 @@
   import { mapActions } from "$lib/stores/map-actions";
   import { settings, isPortConnected, updateMode } from "$lib/stores/settings";
   import { telemetryData, lastTelemetry } from "$lib/stores/telemetry";
-  import { ChevronDown, Copy, Navigation2 as Navigation } from "lucide-svelte";
+  import { ChevronDown, Copy, LocateFixed, Navigation2 as Navigation } from "lucide-svelte";
   import { sendPins } from "$lib/services/transmitter";
   import { connectionStatus } from "$lib/stores/settings";
   import { get } from "svelte/store";
@@ -198,6 +198,20 @@
     } finally {
       isActivatingOfflineMap = false;
     }
+  }
+
+  function focusOfflineMapCenter(): void {
+    if (!map) return;
+    const packageInfo = get(offlineMap);
+    if (!packageInfo) return;
+
+    const { minLon, minLat, maxLon, maxLat } = packageInfo.info;
+    if (![minLon, minLat, maxLon, maxLat].every(Number.isFinite)) return;
+
+    map.easeTo({
+      center: [(minLon + maxLon) / 2, (minLat + maxLat) / 2],
+      duration: 500,
+    });
   }
 
   function syncOfflineMap(packageInfo: OfflineMapPackage | null): void {
@@ -896,6 +910,15 @@
             <p class="mt-2 text-xs text-gray-600">
               {$offlineMap.info.tileKind === "vector" ? "نقشهٔ برداری" : "نقشهٔ رستری"} · محدودهٔ فعال
             </p>
+            <button
+              type="button"
+              class="btn btn-xs btn-outline mt-2 w-full gap-1"
+              onclick={focusOfflineMapCenter}
+              title="رفتن به مرکز بستهٔ نقشه"
+            >
+              <LocateFixed class="h-3.5 w-3.5" />
+              رفتن به مرکز نقشه
+            </button>
           {/if}
         {/if}
         {#if offlineMapActivationError}

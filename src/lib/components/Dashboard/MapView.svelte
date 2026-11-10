@@ -13,8 +13,10 @@
   import { Protocol, TileType } from "pmtiles";
   import { onMount } from "svelte";
   import {
+    activateOfflineMap,
     loadSavedOfflineMaps,
     offlineMap,
+    offlineMaps,
     type OfflineMapPackage,
     type PmtilesOfflineMap,
   } from "$lib/services/offline-maps";
@@ -48,6 +50,9 @@
   let map: MapLibreMap | null = null;
   let pmtilesProtocol: Protocol | null = null;
   let unsubscribeOfflineMap: (() => void) | null = null;
+  let offlineMapsLoading = $state(true);
+  let isActivatingOfflineMap = $state(false);
+  let offlineMapActivationError = $state("");
   let pinMarkers = new Map<number, MapLibreMarker>();
   let locationMarker: MapLibreMarker | null = null;
   let currentPosition = $state({ lat: 35.6895, lng: 51.389 });
@@ -176,6 +181,23 @@
     };
   }
 
+  async function handleOfflineMapSelection(event: Event): Promise<void> {
+    const selectedId = (event.currentTarget as HTMLSelectElement).value;
+    if (!selectedId || selectedId === get(offlineMap)?.info.id) return;
+
+    offlineMapActivationError = "";
+    isActivatingOfflineMap = true;
+    try {
+      await activateOfflineMap(selectedId);
+    } catch (error) {
+      offlineMapActivationError = error instanceof Error
+        ? error.message
+        : "فعال‌سازی نقشه آفلاین ناموفق بود";
+    } finally {
+      isActivatingOfflineMap = false;
+    }
+  }
+
   function syncOfflineMap(packageInfo: OfflineMapPackage | null): void {
     if (!map) return;
     if (!packageInfo) {
@@ -274,10 +296,14 @@
     document.addEventListener("click", handleOutsideClick);
 
     unsubscribeOfflineMap = offlineMap.subscribe(syncOfflineMap);
-    void loadSavedOfflineMaps().catch((error) => {
-      // There is deliberately no network fallback if local map data is unavailable.
-      console.error("Could not load local PMTiles map:", error);
-    });
+    void loadSavedOfflineMaps()
+      .catch((error) => {
+        // There is deliberately no network fallback if local map data is unavailable.
+        console.error("Could not load local PMTiles map:", error);
+      })
+      .finally(() => {
+        offlineMapsLoading = false;
+      });
 
     loadPins()
       .then((pins) => {
@@ -830,6 +856,49 @@
 
     <!-- Collapsible Sidebar with controls -->
     <div class="absolute top-4 right-4 z-[1000] w-56 space-y-2">
+      <!-- Offline map package selector -->
+      <div class="rounded-lg bg-white/80 p-3 shadow-lg backdrop-blur-md">
+        <label class="mb-2 block text-sm font-medium" for="offline-map-package">
+          نقشهٔ آفلاین
+        </label>
+        {#if offlineMapsLoading}
+          <div class="flex items-center gap-2 text-xs text-gray-600">
+            <span class="loading loading-spinner loading-xs"></span>
+            در حال بارگذاری نقشه‌ها...
+          </div>
+        {:else if $offlineMaps.length === 0}
+          <p class="text-xs text-gray-600">
+            بسته‌ای نصب نشده است. ابتدا از تنظیمات یک فایل PMTiles وارد کنید.
+          </p>
+        {:else}
+          <select
+            id="offline-map-package"
+            class="select select-bordered select-sm w-full bg-white text-sm"
+            value={$offlineMap?.info.id ?? ""}
+            onchange={handleOfflineMapSelection}
+            disabled={isActivatingOfflineMap}
+          >
+            <option value="" disabled>انتخاب بستهٔ نقشه</option>
+            {#each $offlineMaps as packageInfo (packageInfo.id)}
+              <option value={packageInfo.id}>{packageInfo.name}</option>
+            {/each}
+          </select>
+          {#if isActivatingOfflineMap}
+            <p class="mt-2 flex items-center gap-2 text-xs text-gray-600" role="status">
+              <span class="loading loading-spinner loading-xs"></span>
+              در حال فعال‌سازی و رفتن به محدوده نقشه...
+            </p>
+          {:else if $offlineMap}
+            <p class="mt-2 text-xs text-gray-600">
+              {$offlineMap.info.tileKind === "vector" ? "نقشهٔ برداری" : "نقشهٔ رستری"} · محدودهٔ فعال
+            </p>
+          {/if}
+        {/if}
+        {#if offlineMapActivationError}
+          <p class="mt-2 text-xs text-error" role="alert">{offlineMapActivationError}</p>
+        {/if}
+      </div>
+
       <!-- Status Information Panel -->
       <div
         class="bg-white/30 bg-opacity-60 backdrop-blur-md rounded-lg shadow-lg"

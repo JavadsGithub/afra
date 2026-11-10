@@ -38,6 +38,8 @@
   import { connectionStatus } from "$lib/stores/settings";
   import { get } from "svelte/store";
 
+  const LOCAL_BASEMAP_ASSETS = `${import.meta.env.BASE_URL}basemap-assets`;
+
   const EMPTY_MAP_STYLE: StyleSpecification = {
     version: 8,
     sources: {},
@@ -170,6 +172,8 @@
 
     return {
       version: 8,
+      sprite: `${LOCAL_BASEMAP_ASSETS}/sprites/v4/light`,
+      glyphs: `${LOCAL_BASEMAP_ASSETS}/fonts/{fontstack}/{range}.pbf`,
       sources: {
         [sourceId]: {
           type: "vector",
@@ -178,8 +182,12 @@
           attribution,
         },
       },
-      // The no-label Protomaps style uses no remote glyphs, sprites, or other assets.
-      layers: protomapsLayers(sourceId, namedFlavor("light")) as unknown as StyleSpecification["layers"],
+      // Persian labels are rendered using bundled glyphs and sprites, with no remote assets.
+      layers: protomapsLayers(
+        sourceId,
+        namedFlavor("light"),
+        { lang: "fa" },
+      ) as unknown as StyleSpecification["layers"],
     };
   }
 

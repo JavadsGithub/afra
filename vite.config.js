@@ -18,6 +18,12 @@ export default defineConfig(async () => ({
     sveltekit(),
   ],
 
+  // MapLibre resolves its web worker relative to its source module; Vite's
+  // dependency optimizer otherwise points that URL at a worker it never copied.
+  optimizeDeps: {
+    exclude: ["maplibre-gl"],
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent vite from obscuring rust errors

@@ -4,11 +4,13 @@
     Map as MapLibreMapClass,
     Marker as MapLibreMarkerClass,
     removeProtocol,
+    setWorkerUrl,
     type Map as MapLibreMap,
     type MapMouseEvent,
     type Marker as MapLibreMarker,
     type StyleSpecification,
   } from "maplibre-gl";
+  import mapLibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
   import { layers as protomapsLayers, namedFlavor } from "@protomaps/basemaps";
   import { Protocol, TileType } from "pmtiles";
   import { onMount } from "svelte";
@@ -241,6 +243,8 @@
     let isDisposed = false;
     pmtilesProtocol = new Protocol({ metadata: false });
     addProtocol("pmtiles", pmtilesProtocol.tile);
+    // Load MapLibre's worker as a Vite-managed asset so it works in dev and in Tauri builds.
+    setWorkerUrl(mapLibreWorkerUrl);
 
     const mapInstance = new MapLibreMapClass({
       container: mapContainer,
@@ -555,7 +559,7 @@
     ></div>
 
     <!-- Direction & Depth indicators -->
-    <div class="absolute top-3 left-14 z-[1000] flex gap-2">
+    <div class="absolute top-3 left-3 z-[1000] flex gap-2">
       <div class="flex flex-col gap-2">
         <!-- Direction indicator -->
         <div

@@ -2,7 +2,6 @@ import { sveltekit } from "@sveltejs/kit/vite";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
 
-// @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vitejs.dev/config/
@@ -18,6 +17,12 @@ export default defineConfig(async () => ({
     }),
     sveltekit(),
   ],
+
+  // MapLibre resolves its web worker relative to its source module; Vite's
+  // dependency optimizer otherwise points that URL at a worker it never copied.
+  optimizeDeps: {
+    exclude: ["maplibre-gl"],
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

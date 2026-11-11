@@ -16,6 +16,17 @@
     import { scanPorts, type PortInfo } from "$lib/services/ports";
     import { exportTelemetries } from "$lib/services/telemetry";
     import { revealItemInDir } from "@tauri-apps/plugin-opener";
+    import {
+        activateOfflineMap as activateOfflineMapService,
+        inspectOfflineMap,
+        loadSavedOfflineMaps,
+        offlineMap,
+        offlineMaps,
+        removeOfflineMap,
+        saveOfflineMap,
+        type OfflineMapCandidate,
+        type OfflineMapInfo,
+    } from "$lib/services/offline-maps";
 
     // Subscribe to the settings store to get current values
     let currentSettings = $settings;
@@ -23,6 +34,7 @@
     onMount(() => {
         loadInterval();
         refreshPorts();
+        loadOfflineMapInfo();
     });
 
     let oldPassword = $state("");
@@ -45,6 +57,140 @@
     let exportError = $state("");
     let exportPath = $state("");
     let exportFormat = $state("csv");
+
+    let offlineMapInput = $state<HTMLInputElement | undefined>(undefined);
+    let offlineMapLoading = $state(true);
+    let offlineMapError = $state("");
+    let offlineMapSuccess = $state("");
+    let isInspectingOfflineMap = $state(false);
+    let isSavingOfflineMap = $state(false);
+    let isActivatingOfflineMap = $state(false);
+    let removingMapId = $state<string | null>(null);
+    let pendingOfflineMap = $state<OfflineMapCandidate | null>(null);
+    let offlineMapAttribution = $state("");
+    let offlineMapName = $state("");
+
+    async function loadOfflineMapInfo() {
+        offlineMapLoading = true;
+        try {
+            await loadSavedOfflineMaps();
+        } catch (error) {
+            offlineMapError = error instanceof Error
+                ? error.message
+                : "بارگذاری نقشه آفلاین ناموفق بود";
+        } finally {
+            offlineMapLoading = false;
+        }
+    }
+
+    async function handleOfflineMapSelection(event: Event) {
+        const input = event.currentTarget as HTMLInputElement;
+        const file = input.files?.[0];
+        input.value = "";
+        if (!file) return;
+
+        offlineMapError = "";
+        offlineMapSuccess = "";
+        pendingOfflineMap = null;
+        offlineMapAttribution = "";
+        offlineMapName = "";
+        isInspectingOfflineMap = true;
+        try {
+            pendingOfflineMap = await inspectOfflineMap(file);
+            offlineMapAttribution = pendingOfflineMap.info.attribution;
+            offlineMapName = pendingOfflineMap.info.name;
+        } catch (error) {
+            offlineMapError = error instanceof Error
+                ? error.message
+                : "بررسی بسته نقشه ناموفق بود";
+        } finally {
+            isInspectingOfflineMap = false;
+        }
+    }
+
+    async function saveSelectedOfflineMap() {
+        if (!pendingOfflineMap || !offlineMapAttribution.trim()) return;
+
+        offlineMapError = "";
+        offlineMapSuccess = "";
+        isSavingOfflineMap = true;
+        try {
+            await saveOfflineMap(
+                pendingOfflineMap,
+                offlineMapAttribution,
+                offlineMapName,
+            );
+            pendingOfflineMap = null;
+            offlineMapSuccess = "بسته نقشه روی این دستگاه ذخیره و فعال شد";
+        } catch (error) {
+            offlineMapError = error instanceof Error
+                ? error.message
+                : "ذخیره نقشه آفلاین ناموفق بود";
+        } finally {
+            isSavingOfflineMap = false;
+        }
+    }
+
+    async function activateMap(id: string) {
+        offlineMapError = "";
+        isActivatingOfflineMap = true;
+        try {
+            await activateOfflineMapService(id);
+            offlineMapSuccess = "نقشه آفلاین فعال شد";
+        } catch (error) {
+            offlineMapError = error instanceof Error
+                ? error.message
+                : "فعال‌سازی نقشه ناموفق بود";
+        } finally {
+            isActivatingOfflineMap = false;
+        }
+    }
+
+    async function deleteOfflineMap(id: string) {
+        const mapInfo = $offlineMaps.find((item) => item.id === id);
+        if (!window.confirm(`بسته «${mapInfo?.name ?? "نقشه آفلاین"}» حذف شود؟`)) return;
+
+        offlineMapError = "";
+        offlineMapSuccess = "";
+        removingMapId = id;
+        try {
+            await removeOfflineMap(id);
+            offlineMapSuccess = "بسته نقشه حذف شد";
+        } catch (error) {
+            offlineMapError = error instanceof Error
+                ? error.message
+                : "حذف نقشه آفلاین ناموفق بود";
+        } finally {
+            removingMapId = null;
+        }
+    }
+
+    function cancelOfflineMapSelection() {
+        pendingOfflineMap = null;
+        offlineMapAttribution = "";
+        offlineMapName = "";
+        offlineMapError = "";
+    }
+
+    function formatBytes(bytes: number): string {
+        if (bytes < 1024) return `${bytes} B`;
+        const units = ["KB", "MB", "GB", "TB"];
+        let size = bytes / 1024;
+        let unitIndex = 0;
+        while (size >= 1024 && unitIndex < units.length - 1) {
+            size /= 1024;
+            unitIndex += 1;
+        }
+        return `${size.toFixed(size >= 100 ? 0 : 1)} ${units[unitIndex]}`;
+    }
+
+    function tileKindLabel(info: Pick<OfflineMapInfo, "tileKind">): string {
+        return info.tileKind === "vector" ? "برداری" : "رستری";
+    }
+
+    function formatBounds(info: Pick<OfflineMapInfo, "minLat" | "minLon" | "maxLat" | "maxLon">): string {
+        return `${info.minLat.toFixed(2)}, ${info.minLon.toFixed(2)} تا ${info.maxLat.toFixed(2)}, ${info.maxLon.toFixed(2)}`;
+    }
 
     async function handleExportData() {
         exportSuccess = "";
@@ -181,6 +327,14 @@
                 onclick={() => (activeTab = "data")}
             >
                 داده‌ها
+            </button>
+            <button
+                role="tab"
+                class="tab"
+                class:tab-active={activeTab === "map"}
+                onclick={() => (activeTab = "map")}
+            >
+                نقشه آفلاین
             </button>
         </div>
         <div class="p-6">
@@ -528,6 +682,148 @@
                                     : exportFormat.toUpperCase()})
                             </button>
                         </div>
+                    </div>
+                </div>
+            {:else if activeTab === "map"}
+                <div class="card bg-base-200">
+                    <div class="card-body gap-5">
+                        <section class="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+                            <div class="max-w-3xl">
+                                <h3 class="card-title">مدیریت نقشه آفلاین</h3>
+                                <p class="text-sm text-gray-600 mt-2">
+                                    نقشه فقط از بسته‌های PMTiles ذخیره‌شده روی همین دستگاه ساخته می‌شود؛ هیچ منبع اینترنتی یا نقشهٔ آنلاین به کار نمی‌رود.
+                                </p>
+                                <p class="text-xs text-gray-500 mt-2">
+                                    اطلاعات انتساب از فرادادهٔ بستهٔ واردشده حفظ می‌شود.
+                                </p>
+                            </div>
+
+                            <div class="shrink-0">
+                                <input
+                                    bind:this={offlineMapInput}
+                                    id="offline-map-file"
+                                    class="hidden"
+                                    type="file"
+                                    accept=".pmtiles,application/octet-stream"
+                                    onchange={handleOfflineMapSelection}
+                                />
+                                <button
+                                    class="btn btn-primary"
+                                    onclick={() => offlineMapInput?.click()}
+                                    disabled={offlineMapLoading || isInspectingOfflineMap || isSavingOfflineMap}
+                                >
+                                    {#if isInspectingOfflineMap}
+                                        <span class="loading loading-spinner loading-sm"></span>
+                                        در حال بررسی...
+                                    {:else}
+                                        وارد کردن PMTiles
+                                    {/if}
+                                </button>
+                            </div>
+                        </section>
+
+                        <section class="alert alert-info">
+                            <div>
+                                <h4 class="font-semibold">نقشهٔ محلی و کاملاً آفلاین</h4>
+                                <p class="text-sm mt-1">
+                                    برنامه هیچ کاشی یا دادهٔ جستجوی مکان را از اینترنت دریافت نمی‌کند. در بسته‌های برداری، فهرست نام‌ها از کل آرشیو روی همین دستگاه ساخته و ذخیره می‌شود؛ بسته‌های رستری جستجوی نام ندارند.
+                                </p>
+                            </div>
+                        </section>
+
+                        {#if pendingOfflineMap}
+                            <section class="rounded-lg border border-primary/30 bg-base-100 p-4 space-y-4">
+                                <div>
+                                    <h4 class="font-semibold">آمادهٔ نصب: {pendingOfflineMap.info.name}</h4>
+                                    <p class="text-xs text-gray-500 break-all mt-1">{pendingOfflineMap.info.fileName}</p>
+                                    <p class="text-xs text-gray-500 mt-2">
+                                        {formatBytes(pendingOfflineMap.info.sizeBytes)} · {tileKindLabel(pendingOfflineMap.info)} · زوم {pendingOfflineMap.info.minZoom}–{pendingOfflineMap.info.maxZoom} · محدوده {formatBounds(pendingOfflineMap.info)}
+                                    </p>
+                                </div>
+                                <div class="form-control">
+                                    <label class="label" for="offline-map-name"><span class="label-text">نام نمایشی</span></label>
+                                    <input id="offline-map-name" class="input input-bordered" bind:value={offlineMapName} disabled={isSavingOfflineMap} />
+                                </div>
+                                <div class="form-control">
+                                    <label class="label" for="offline-map-attribution"><span class="label-text">انتساب منبع نقشه</span></label>
+                                    <textarea
+                                        id="offline-map-attribution"
+                                        class="textarea textarea-bordered w-full min-h-20"
+                                        bind:value={offlineMapAttribution}
+                                        placeholder="انتساب تعیین‌شده توسط ارائه‌دهندهٔ بسته"
+                                        disabled={isSavingOfflineMap}
+                                    ></textarea>
+                                </div>
+                                <div class="flex flex-wrap gap-2">
+                                    <button class="btn btn-primary" onclick={saveSelectedOfflineMap} disabled={isSavingOfflineMap || !offlineMapAttribution.trim()}>
+                                        {#if isSavingOfflineMap}<span class="loading loading-spinner loading-sm"></span>{/if}
+                                        ذخیره و فعال‌سازی
+                                    </button>
+                                    <button class="btn btn-ghost" onclick={cancelOfflineMapSelection} disabled={isSavingOfflineMap}>انصراف</button>
+                                </div>
+                            </section>
+                        {/if}
+
+                        <section class="space-y-3">
+                            <div class="flex items-center justify-between gap-3">
+                                <h4 class="font-semibold">بسته‌های نصب‌شده</h4>
+                                <span class="badge badge-ghost">{$offlineMaps.length}</span>
+                            </div>
+                            {#if offlineMapLoading}
+                                <div class="flex items-center gap-3 text-sm text-gray-500">
+                                    <span class="loading loading-spinner loading-sm"></span>
+                                    در حال بارگذاری بسته‌ها...
+                                </div>
+                            {:else if $offlineMaps.length === 0}
+                                <div class="alert alert-info">
+                                    <span>بسته‌ای نصب نشده است. یک فایل PMTiles محلی وارد کنید تا نقشه بدون اتصال اینترنت نمایش داده شود.</span>
+                                </div>
+                            {:else}
+                                <div class="space-y-3">
+                                    {#each $offlineMaps as mapInfo (mapInfo.id)}
+                                        <article class="rounded-lg border {$offlineMap?.info.id === mapInfo.id ? 'border-success/50 bg-success/5' : 'border-base-300 bg-base-100'} p-4">
+                                            <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                                                <div class="min-w-0 space-y-1">
+                                                    <div class="flex flex-wrap items-center gap-2">
+                                                        <h5 class="font-semibold break-words">{mapInfo.name}</h5>
+                                                        {#if $offlineMap?.info.id === mapInfo.id}<span class="badge badge-success badge-sm">فعال</span>{/if}
+                                                        <span class="badge badge-outline badge-sm">PMTiles محلی</span>
+                                                    </div>
+                                                    <p class="text-xs text-gray-500 break-all">{mapInfo.fileName}</p>
+                                                </div>
+                                                <div class="flex flex-wrap gap-2 shrink-0">
+                                                    {#if $offlineMap?.info.id !== mapInfo.id}
+                                                        <button class="btn btn-sm btn-outline btn-primary" onclick={() => activateMap(mapInfo.id)} disabled={isActivatingOfflineMap || removingMapId !== null}>
+                                                            {#if isActivatingOfflineMap}<span class="loading loading-spinner loading-xs"></span>{/if}
+                                                            فعال‌سازی
+                                                        </button>
+                                                    {/if}
+                                                    <button class="btn btn-sm btn-outline btn-error" onclick={() => deleteOfflineMap(mapInfo.id)} disabled={removingMapId !== null || isActivatingOfflineMap}>
+                                                        {#if removingMapId === mapInfo.id}<span class="loading loading-spinner loading-xs"></span>{/if}
+                                                        حذف
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm mt-4">
+                                                <p><span class="font-medium">حجم:</span> {formatBytes(mapInfo.sizeBytes)}</p>
+                                                <p><span class="font-medium">تعداد کاشی:</span> {mapInfo.tileCount.toLocaleString()}</p>
+                                                <p><span class="font-medium">قالب:</span> {tileKindLabel(mapInfo)}</p>
+                                                <p><span class="font-medium">بازهٔ زوم:</span> {mapInfo.minZoom} تا {mapInfo.maxZoom}</p>
+                                                <p><span class="font-medium">محدوده (عرض، طول):</span> {formatBounds(mapInfo)}</p>
+                                                <p class="sm:col-span-2 break-words"><span class="font-medium">انتساب منبع:</span> {mapInfo.attribution}</p>
+                                            </div>
+                                        </article>
+                                    {/each}
+                                </div>
+                            {/if}
+                        </section>
+
+                        {#if offlineMapError}
+                            <div class="alert alert-error" role="alert"><span>{offlineMapError}</span></div>
+                        {/if}
+                        {#if offlineMapSuccess}
+                            <div class="alert alert-success" role="status"><span>{offlineMapSuccess}</span></div>
+                        {/if}
                     </div>
                 </div>
             {/if}

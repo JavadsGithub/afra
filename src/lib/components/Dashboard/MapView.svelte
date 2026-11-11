@@ -1,8 +1,27 @@
 <script lang="ts">
-  import * as L from "leaflet";
-  import "leaflet/dist/leaflet.css";
-  import { onDestroy, onMount } from "svelte";
-  // Import pin service instead of store
+  import {
+    addProtocol,
+    Map as MapLibreMapClass,
+    Marker as MapLibreMarkerClass,
+    removeProtocol,
+    setWorkerUrl,
+    type Map as MapLibreMap,
+    type MapMouseEvent,
+    type Marker as MapLibreMarker,
+    type StyleSpecification,
+  } from "maplibre-gl";
+  import mapLibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
+  import { layers as protomapsLayers, namedFlavor } from "@protomaps/basemaps";
+  import { Protocol, TileType } from "pmtiles";
+  import { onMount } from "svelte";
+  import {
+    activateOfflineMap,
+    loadSavedOfflineMaps,
+    offlineMap,
+    offlineMaps,
+    type OfflineMapPackage,
+    type PmtilesOfflineMap,
+  } from "$lib/services/offline-maps";
   import {
     type Pin,
     addPin,
@@ -10,34 +29,68 @@
     loadPins,
     updatePin,
   } from "$lib/services/pins";
-  // Import command service functions
   import { scanPorts } from "$lib/services/ports";
   import { mapActions } from "$lib/stores/map-actions";
   import { settings, isPortConnected, updateMode } from "$lib/stores/settings";
   import { telemetryData, lastTelemetry } from "$lib/stores/telemetry";
-  import { ChevronDown, Copy, Navigation2 as Navigation } from "lucide-svelte";
+  import {
+    deleteOfflineSearchIndex,
+    loadOfflineSearchIndex,
+    normalizeSearchText,
+    saveOfflineSearchIndex,
+    searchOfflineMapIndex,
+    type OfflineSearchEntry,
+    type OfflineSearchIndex,
+    type OfflineSearchWorkerResponse,
+  } from "$lib/services/offline-search";
+  import { ChevronDown, Copy, LocateFixed, MapPin, Navigation2 as Navigation, Search } from "lucide-svelte";
   import { sendPins } from "$lib/services/transmitter";
   import { connectionStatus } from "$lib/stores/settings";
-  import icon from "leaflet/dist/images/marker-icon.png";
-  import iconShadow from "leaflet/dist/images/marker-shadow.png";
   import { get } from "svelte/store";
 
-  type LeafletMap = L.Map;
+  const LOCAL_BASEMAP_ASSETS = `${import.meta.env.BASE_URL}basemap-assets`;
+
+  const EMPTY_MAP_STYLE: StyleSpecification = {
+    version: 8,
+    sources: {},
+    layers: [{
+      id: "offline-background",
+      type: "background",
+      paint: { "background-color": "#e8e7e2" },
+    }],
+  };
 
   let mapContainer: HTMLDivElement;
-  let map: LeafletMap;
+  let map: MapLibreMap | null = null;
+  let pmtilesProtocol: Protocol | null = null;
+  let unsubscribeOfflineMap: (() => void) | null = null;
+  let offlineMapsLoading = $state(true);
+  let isActivatingOfflineMap = $state(false);
+  let offlineMapActivationError = $state("");
+  let offlineSearchQuery = $state("");
+  let offlineSearchResultSelected = $state(false);
+  let offlineSearchResults = $state<OfflineSearchEntry[]>([]);
+  let offlineSearchIndex = $state.raw<OfflineSearchIndex | null>(null);
+  let offlineSearchState = $state<"idle" | "loading" | "building" | "ready" | "error" | "unsupported">("idle");
+  let offlineSearchError = $state("");
+  let offlineSearchCacheWarning = $state("");
+  let offlineSearchCompleted = $state(0);
+  let offlineSearchTotal = $state(0);
+  let offlineSearchUnreadableTiles = $state(0);
+  let offlineSearchWorker: Worker | null = null;
+  let offlineSearchRequestId: string | null = null;
+  let offlineSearchMapId: string | null = null;
+  let offlineSearchGeneration = 0;
+  let offlineSearchRequestSequence = 0;
+  let searchResultMarker: MapLibreMarker | null = null;
+  let pinMarkers = new Map<number, MapLibreMarker>();
+  let locationMarker: MapLibreMarker | null = null;
   let currentPosition = $state({ lat: 35.6895, lng: 51.389 });
   let coordinates = $state("0, 0");
 
-  // Backend pins state
   let backendPins = $state<Pin[]>([]);
-
-  // Map layers state
-  let baseLayer = $state(true);
   let routesLayer = $state(false);
   let objectsLayer = $state(true);
-
-  // Context menu state
   let showContextMenu = $state(false);
   let contextMenuPosition = $state({ x: 0, y: 0 });
   let contextMenuLatLng = $state({ lat: 0, lng: 0 });
@@ -72,119 +125,474 @@
   }
   let pinFrames = $state<PinFrame[]>([]);
 
-  // Initialize the map when the component mounts
-  onMount(() => {
-    // Fix for default marker icons in Leaflet with Vite
-    // @ts-ignore: _getIconUrl property exists but is not typed
-    delete L.Icon.Default.prototype._getIconUrl;
-    L.Icon.Default.mergeOptions({
-      iconUrl: icon,
-      iconRetinaUrl: icon,
-      shadowUrl: iconShadow,
+  function escapeHtml(value: string): string {
+    return value.replace(/[&<>"']/g, (character) => {
+      const replacements: Record<string, string> = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      };
+      return replacements[character] ?? character;
     });
+  }
 
-    // Initialize the map
-    map = L.map(mapContainer).setView(
-      [currentPosition.lat, currentPosition.lng],
-      13,
-    );
+  function rasterTileExtension(tileType: TileType): string {
+    switch (tileType) {
+      case TileType.Png:
+        return ".png";
+      case TileType.Jpeg:
+        return ".jpg";
+      case TileType.Webp:
+        return ".webp";
+      case TileType.Avif:
+        return ".avif";
+      default:
+        return "";
+    }
+  }
 
-    // Add OpenStreetMap tile layer
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution:
-        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-      maxZoom: 19,
-    }).addTo(map);
+  function offlineStyleFor(packageInfo: PmtilesOfflineMap): StyleSpecification {
+    const sourceId = "local-basemap";
+    const sourceKey = `afra-local/${packageInfo.info.id}`;
+    const attribution = escapeHtml(packageInfo.info.attribution);
+    const bounds: [number, number, number, number] = [
+      packageInfo.info.minLon,
+      packageInfo.info.minLat,
+      packageInfo.info.maxLon,
+      packageInfo.info.maxLat,
+    ];
 
-    // Load pins from backend
-    loadPins()
-      .then((pins) => {
-        backendPins = pins;
-        updateMarkersOnMap();
-      })
-      .catch((error) => {
-        console.error("Error loading pins:", error);
-      });
+    if (packageInfo.info.tileKind === "raster") {
+      return {
+        version: 8,
+        sources: {
+          [sourceId]: {
+            type: "raster",
+            tiles: [
+              `pmtiles://${sourceKey}/{z}/{x}/{y}${rasterTileExtension(packageInfo.header.tileType)}`,
+            ],
+            tileSize: 256,
+            minzoom: packageInfo.info.minZoom,
+            maxzoom: packageInfo.info.maxZoom,
+            bounds,
+            attribution,
+          },
+        },
+        layers: [
+          {
+            id: "offline-background",
+            type: "background",
+            paint: { "background-color": "#e8e7e2" },
+          },
+          {
+            id: "offline-raster",
+            type: "raster",
+            source: sourceId,
+            paint: { "raster-fade-duration": 0 },
+          },
+        ],
+      };
+    }
 
-    // Listen for robot data received events
+    return {
+      version: 8,
+      sprite: `${LOCAL_BASEMAP_ASSETS}/sprites/v4/light`,
+      glyphs: `${LOCAL_BASEMAP_ASSETS}/fonts/{fontstack}/{range}.pbf`,
+      sources: {
+        [sourceId]: {
+          type: "vector",
+          url: `pmtiles://${sourceKey}`,
+          bounds,
+          attribution,
+        },
+      },
+      // Persian labels are rendered using bundled glyphs and sprites, with no remote assets.
+      layers: protomapsLayers(
+        sourceId,
+        namedFlavor("light"),
+        { lang: "fa" },
+      ) as unknown as StyleSpecification["layers"],
+    };
+  }
 
-    // Add click event to get coordinates
-    map.on("click", (e: any) => {
-      currentPosition = { lat: e.latlng.lat, lng: e.latlng.lng };
-      coordinates = `${e.latlng.lat.toFixed(6)}, ${e.latlng.lng.toFixed(6)}`;
+  async function handleOfflineMapSelection(event: Event): Promise<void> {
+    const selectedId = (event.currentTarget as HTMLSelectElement).value;
+    if (!selectedId || selectedId === get(offlineMap)?.info.id) return;
+
+    offlineMapActivationError = "";
+    isActivatingOfflineMap = true;
+    try {
+      await activateOfflineMap(selectedId);
+    } catch (error) {
+      offlineMapActivationError = error instanceof Error
+        ? error.message
+        : "فعال‌سازی نقشه آفلاین ناموفق بود";
+    } finally {
+      isActivatingOfflineMap = false;
+    }
+  }
+
+  function focusOfflineMapCenter(): void {
+    if (!map) return;
+    const packageInfo = get(offlineMap);
+    if (!packageInfo) return;
+
+    const { minLon, minLat, maxLon, maxLat } = packageInfo.info;
+    if (![minLon, minLat, maxLon, maxLat].every(Number.isFinite)) return;
+
+    map.easeTo({
+      center: [(minLon + maxLon) / 2, (minLat + maxLat) / 2],
+      duration: 500,
     });
+  }
 
-    // Add right-click event to show context menu
-    map.on("contextmenu", (e: any) => {
-      // Prevent the default browser context menu
-      const event = e.originalEvent;
+  function syncOfflineMap(packageInfo: OfflineMapPackage | null): void {
+    if (!map) return;
+    if (!packageInfo) {
+      map.setStyle(EMPTY_MAP_STYLE);
+      return;
+    }
+
+    pmtilesProtocol?.add(packageInfo.pmtiles);
+    map.setStyle(offlineStyleFor(packageInfo));
+    const info = packageInfo.info;
+    if (
+      [info.minLon, info.minLat, info.maxLon, info.maxLat].every(Number.isFinite) &&
+      info.minLon < info.maxLon &&
+      info.minLat < info.maxLat
+    ) {
+      map.fitBounds(
+        [[info.minLon, info.minLat], [info.maxLon, info.maxLat]],
+        { padding: 24, maxZoom: Math.min(13, info.maxZoom), duration: 0 },
+      );
+    }
+  }
+
+  function stopOfflineSearchWorker(): void {
+    offlineSearchWorker?.terminate();
+    offlineSearchWorker = null;
+    offlineSearchRequestId = null;
+  }
+
+  function updateOfflineSearchResults(): void {
+    if (offlineSearchResultSelected || !offlineSearchIndex || offlineSearchState !== "ready") {
+      offlineSearchResults = [];
+      return;
+    }
+
+    const normalizedQuery = normalizeSearchText(offlineSearchQuery);
+    if ([...normalizedQuery].length < 2) {
+      offlineSearchResults = [];
+      return;
+    }
+
+    const center = map?.getCenter();
+    const origin: [number, number] = center
+      ? [center.lng, center.lat]
+      : [currentPosition.lng, currentPosition.lat];
+    offlineSearchResults = searchOfflineMapIndex(offlineSearchIndex, offlineSearchQuery, origin, 8);
+  }
+
+  function startOfflineSearchIndex(): void {
+    const packageInfo = get(offlineMap);
+    if (
+      !packageInfo ||
+      packageInfo.info.tileKind !== "vector" ||
+      packageInfo.info.id !== offlineSearchMapId ||
+      offlineSearchWorker ||
+      offlineSearchState === "building"
+    ) {
+      return;
+    }
+
+    offlineSearchState = "building";
+    offlineSearchError = "";
+    offlineSearchCacheWarning = "";
+    offlineSearchCompleted = 0;
+    offlineSearchTotal = packageInfo.header.numAddressedTiles;
+    const requestId = `offline-search-${Date.now()}-${++offlineSearchRequestSequence}`;
+    offlineSearchRequestId = requestId;
+
+    try {
+      const worker = new Worker(
+        new URL("../../workers/offline-map-search.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+      offlineSearchWorker = worker;
+      worker.onmessage = (event: MessageEvent<OfflineSearchWorkerResponse>) => {
+        const message = event.data;
+        if (
+          message.requestId !== offlineSearchRequestId ||
+          packageInfo.info.id !== offlineSearchMapId
+        ) {
+          return;
+        }
+
+        if (message.type === "progress") {
+          offlineSearchCompleted = message.completed;
+          offlineSearchTotal = message.total;
+          return;
+        }
+        if (message.type === "cancelled") {
+          stopOfflineSearchWorker();
+          offlineSearchState = "idle";
+          return;
+        }
+        if (message.type === "error") {
+          stopOfflineSearchWorker();
+          offlineSearchState = "error";
+          offlineSearchError = message.error;
+          return;
+        }
+
+        stopOfflineSearchWorker();
+        offlineSearchIndex = message.index;
+        offlineSearchState = "ready";
+        offlineSearchUnreadableTiles = message.unreadableTiles ?? 0;
+        updateOfflineSearchResults();
+
+        void saveOfflineSearchIndex(packageInfo.info.id, message.index)
+          .then(async () => {
+            if (!get(offlineMaps).some((item) => item.id === packageInfo.info.id)) {
+              await deleteOfflineSearchIndex(packageInfo.info.id);
+            }
+          })
+          .catch((error: unknown) => {
+            if (offlineSearchMapId === packageInfo.info.id) {
+              offlineSearchCacheWarning = error instanceof Error
+                ? "فهرست آماده است، اما ذخیرهٔ ماندگار آن ناموفق بود."
+                : "فهرست آماده است، اما ذخیرهٔ ماندگار آن ممکن نشد.";
+            }
+          });
+      };
+      worker.onerror = (event: ErrorEvent) => {
+        if (offlineSearchRequestId !== requestId) return;
+        stopOfflineSearchWorker();
+        offlineSearchState = "error";
+        offlineSearchError = event.message || "ساخت فهرست جستجو ناموفق بود";
+      };
+      worker.postMessage({ type: "build", requestId, file: packageInfo.file });
+    } catch (error) {
+      stopOfflineSearchWorker();
+      offlineSearchState = "error";
+      offlineSearchError = error instanceof Error
+        ? error.message
+        : "ساخت فهرست جستجو ناموفق بود";
+    }
+  }
+
+  function cancelOfflineSearchIndex(): void {
+    if (offlineSearchWorker && offlineSearchRequestId) {
+      offlineSearchWorker.postMessage({ type: "cancel", requestId: offlineSearchRequestId });
+    }
+    stopOfflineSearchWorker();
+    offlineSearchState = "idle";
+    offlineSearchCompleted = 0;
+    offlineSearchResults = [];
+  }
+
+  function handleOfflineSearchInput(event: Event): void {
+    offlineSearchQuery = (event.currentTarget as HTMLInputElement).value;
+    offlineSearchResultSelected = false;
+    offlineSearchResults = [];
+    if ([...normalizeSearchText(offlineSearchQuery)].length < 2) return;
+
+    if (offlineSearchState === "ready") updateOfflineSearchResults();
+    else if (offlineSearchState === "idle" || offlineSearchState === "error") {
+      startOfflineSearchIndex();
+    }
+  }
+
+  function handleOfflineSearchKeydown(event: KeyboardEvent): void {
+    if (event.key === "Enter" && offlineSearchResults.length > 0) {
       event.preventDefault();
+      focusOfflineSearchResult(offlineSearchResults[0]);
+    }
+  }
 
-      // Calculate the position for the context menu (position to the bottom-right of cursor)
+  function focusOfflineSearchResult(entry: OfflineSearchEntry): void {
+    if (!map) return;
+    currentPosition = { lat: entry.lat, lng: entry.lon };
+    searchResultMarker?.remove();
+    searchResultMarker = new MapLibreMarkerClass({ color: "#16a34a" })
+      .setLngLat([entry.lon, entry.lat])
+      .addTo(map);
+
+    const archiveMaxZoom = offlineSearchIndex?.maxZoom ?? 15;
+    map.easeTo({
+      center: [entry.lon, entry.lat],
+      zoom: Math.min(Math.max(map.getZoom(), 13), archiveMaxZoom),
+      duration: 650,
+    });
+    offlineSearchQuery = entry.title;
+    offlineSearchResultSelected = true;
+    offlineSearchResults = [];
+  }
+
+  function searchLayerLabel(layer: OfflineSearchEntry["layer"]): string {
+    switch (layer) {
+      case "earth": return "منطقه";
+      case "landcover": return "پوشش زمین";
+      case "landuse": return "کاربری زمین";
+      case "places": return "مکان";
+      case "pois": return "نقطهٔ موردعلاقه";
+      case "roads": return "راه";
+      case "water": return "آبراه یا پهنهٔ آبی";
+      case "buildings": return "ساختمان";
+      case "boundaries": return "مرز";
+      default: return layer.replace(/[_-]/g, " ");
+    }
+  }
+
+  function handleOfflineMapChange(packageInfo: OfflineMapPackage | null): void {
+    syncOfflineMap(packageInfo);
+    const mapId = packageInfo?.info.id ?? null;
+    if (mapId === offlineSearchMapId) return;
+
+    offlineSearchMapId = mapId;
+    const generation = ++offlineSearchGeneration;
+    stopOfflineSearchWorker();
+    offlineSearchIndex = null;
+    offlineSearchResultSelected = false;
+    offlineSearchResults = [];
+    offlineSearchError = "";
+    offlineSearchCacheWarning = "";
+    offlineSearchCompleted = 0;
+    offlineSearchTotal = 0;
+    offlineSearchUnreadableTiles = 0;
+    searchResultMarker?.remove();
+    searchResultMarker = null;
+
+    if (!packageInfo) {
+      offlineSearchState = "idle";
+      return;
+    }
+    if (packageInfo.info.tileKind !== "vector") {
+      offlineSearchState = "unsupported";
+      return;
+    }
+
+    const activeMapId = packageInfo.info.id;
+    offlineSearchState = "loading";
+    void loadOfflineSearchIndex(activeMapId).then((index) => {
+      if (generation !== offlineSearchGeneration || offlineSearchMapId !== activeMapId) return;
+      if (index) {
+        offlineSearchIndex = index;
+        offlineSearchState = "ready";
+        updateOfflineSearchResults();
+        return;
+      }
+      offlineSearchState = "idle";
+      if ([...normalizeSearchText(offlineSearchQuery)].length >= 2) {
+        startOfflineSearchIndex();
+      }
+    }).catch((error: unknown) => {
+      if (generation !== offlineSearchGeneration || offlineSearchMapId !== activeMapId) return;
+      offlineSearchState = "error";
+      offlineSearchError = error instanceof Error
+        ? error.message
+        : "فهرست جستجوی محلی بارگذاری نشد";
+    });
+  }
+
+  function updateMarkersOnMap(): void {
+    if (!map) return;
+    for (const marker of pinMarkers.values()) marker.remove();
+    pinMarkers.clear();
+
+    for (const pin of backendPins) {
+      const marker = new MapLibreMarkerClass({ color: "#dc2626" })
+        .setLngLat([pin.lng, pin.lat])
+        .addTo(map);
+      marker.getElement().addEventListener("click", (event: MouseEvent) => {
+        event.stopPropagation();
+        onPinSelected(pin);
+      });
+      pinMarkers.set(pin.id, marker);
+    }
+  }
+
+  onMount(() => {
+    let isDisposed = false;
+    pmtilesProtocol = new Protocol({ metadata: false });
+    addProtocol("pmtiles", pmtilesProtocol.tile);
+    // Load MapLibre's worker as a Vite-managed asset so it works in dev and in Tauri builds.
+    setWorkerUrl(mapLibreWorkerUrl);
+
+    const mapInstance = new MapLibreMapClass({
+      container: mapContainer,
+      style: EMPTY_MAP_STYLE,
+      center: [currentPosition.lng, currentPosition.lat],
+      zoom: 13,
+      maxZoom: 22,
+    });
+    map = mapInstance;
+
+    mapInstance.on("click", (event: MapMouseEvent) => {
+      currentPosition = { lat: event.lngLat.lat, lng: event.lngLat.lng };
+      coordinates = `${event.lngLat.lat.toFixed(6)}, ${event.lngLat.lng.toFixed(6)}`;
+      showContextMenu = false;
+    });
+
+    mapInstance.on("contextmenu", (event: MapMouseEvent) => {
+      const nativeEvent = event.originalEvent;
+      nativeEvent.preventDefault();
       const mapBounds = mapContainer.getBoundingClientRect();
-      let x = event.clientX - mapBounds.left;
-      let y = event.clientY - mapBounds.top;
-
+      let x = nativeEvent.clientX - mapBounds.left;
+      let y = nativeEvent.clientY - mapBounds.top;
       const menuWidth = 150;
       const menuHeight = 40;
-
-      if (x + menuWidth > mapBounds.width) {
-        x = Math.max(0, event.clientX - mapBounds.left - menuWidth);
-      }
-
-      if (y + menuHeight > mapBounds.height) {
-        y = Math.max(0, event.clientY - mapBounds.top - menuHeight);
-      }
+      if (x + menuWidth > mapBounds.width) x = Math.max(0, x - menuWidth);
+      if (y + menuHeight > mapBounds.height) y = Math.max(0, y - menuHeight);
 
       contextMenuPosition = { x, y };
-      contextMenuLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
-
-      // Check if we're right-clicking on an existing pin
-      contextMenuPinId = null; // Reset the pin ID
-      const clickedLat = e.latlng.lat;
-      const clickedLng = e.latlng.lng;
-
-      // Iterate through all pins to see if any are at this location (with a small tolerance)
+      contextMenuLatLng = { lat: event.lngLat.lat, lng: event.lngLat.lng };
+      contextMenuPinId = null;
       for (const pin of backendPins) {
-        // Check if the click is close to an existing pin (within 0.0001 degrees ~ 11 meters)
         if (
-          Math.abs(pin.lat - clickedLat) < 0.0001 &&
-          Math.abs(pin.lng - clickedLng) < 0.0001
+          Math.abs(pin.lat - event.lngLat.lat) < 0.0001 &&
+          Math.abs(pin.lng - event.lngLat.lng) < 0.0001
         ) {
           contextMenuPinId = pin.id;
           break;
         }
       }
-
-      // Show the context menu
       showContextMenu = true;
     });
 
-    // Close context menu when clicking elsewhere on the map
-    map.on("click", () => {
-      showContextMenu = false;
-    });
-
-    // Watch for zoom/pan changes to update the coordinate display
-    map.on("moveend", () => {
-      const center = map.getCenter();
+    mapInstance.on("moveend", () => {
+      const center = mapInstance.getCenter();
       coordinates = `${center.lat.toFixed(6)}, ${center.lng.toFixed(6)}`;
+      updateOfflineSearchResults();
     });
 
-    // Add event listener to close context menu when clicking outside the map
-    const handleOutsideClick = (e: Event) => {
-      if (
-        showContextMenu &&
-        mapContainer &&
-        !mapContainer.contains(e.target as Node)
-      ) {
+    const handleOutsideClick = (event: Event) => {
+      if (showContextMenu && !mapContainer.contains(event.target as Node)) {
         showContextMenu = false;
       }
     };
-
     document.addEventListener("click", handleOutsideClick);
 
-    // Auto-detect serial port if none configured
+    unsubscribeOfflineMap = offlineMap.subscribe(handleOfflineMapChange);
+    void loadSavedOfflineMaps()
+      .catch((error) => {
+        // There is deliberately no network fallback if local map data is unavailable.
+        console.error("Could not load local PMTiles map:", error);
+      })
+      .finally(() => {
+        offlineMapsLoading = false;
+      });
+
+    loadPins()
+      .then((pins) => {
+        if (isDisposed) return;
+        backendPins = pins;
+        updateMarkersOnMap();
+      })
+      .catch((error) => console.error("Error loading pins:", error));
+
     if (!$settings.port) {
       scanPorts()
         .then((ports) => {
@@ -196,74 +604,54 @@
         .catch(() => {});
     }
 
-    // Cleanup function
     return () => {
+      isDisposed = true;
+      offlineSearchGeneration++;
+      stopOfflineSearchWorker();
+      searchResultMarker?.remove();
+      searchResultMarker = null;
+      unsubscribeOfflineMap?.();
+      unsubscribeOfflineMap = null;
       document.removeEventListener("click", handleOutsideClick);
-      if (map) {
-        map.remove();
-      }
+      for (const marker of pinMarkers.values()) marker.remove();
+      pinMarkers.clear();
+      locationMarker?.remove();
+      locationMarker = null;
+      map?.remove();
+      map = null;
+      removeProtocol("pmtiles");
+      pmtilesProtocol?.tiles.clear();
+      pmtilesProtocol = null;
     };
   });
 
-  // Function to update markers on the map based on backend pins
-  function updateMarkersOnMap(): void {
-    // This implementation will clear existing markers and add new ones from backendPins
-    // In a real implementation, you would want to optimize this to only add/remove changed markers
-    map.eachLayer((layer) => {
-      if (layer instanceof L.Marker) {
-        map.removeLayer(layer);
-      }
-    });
-
-    // Add markers for all backend pins
-    backendPins.forEach((pin) => {
-      const marker = L.marker([pin.lat, pin.lng]).addTo(map);
-      // Add click event to open pin details modal
-      marker.on("click", () => {
-        onPinSelected(pin);
-      });
-    });
-  }
-
   // Handle layer toggles
-
   $effect(() => {
-    if (map && routesLayer) {
-      console.log("Routes layer enabled");
-    }
+    if (map && routesLayer) console.log("Routes layer enabled");
   });
 
   $effect(() => {
-    if (map && objectsLayer) {
-      console.log("Objects layer enabled");
-    }
+    if (map && objectsLayer) console.log("Objects layer enabled");
   });
 
-  // Map control functions
   function zoomIn(): void {
-    if (map) map.zoomIn();
+    map?.zoomIn();
   }
 
   function zoomOut(): void {
-    if (map) map.zoomOut();
-  }
-
-  function searchLocation(): void {
-    // Basic implementation - you can expand this
-    alert("جستجوی مکان");
+    map?.zoomOut();
   }
 
   function markLocation(): void {
-    if (map && currentPosition) {
-      const marker = L.marker([currentPosition.lat, currentPosition.lng]).addTo(
-        map,
-      );
-      map.setView([currentPosition.lat, currentPosition.lng], 15);
-    }
+    if (!map) return;
+    locationMarker?.remove();
+    locationMarker = new MapLibreMarkerClass({ color: "#2563eb" })
+      .setLngLat([currentPosition.lng, currentPosition.lat])
+      .addTo(map);
+    map.easeTo({ center: [currentPosition.lng, currentPosition.lat], zoom: 15 });
   }
 
   function measureDistance(): void {
-    // Basic implementation - you can expand this
     alert("اندازه گیری فاصله");
   }
 
@@ -359,13 +747,6 @@
     showContextMenu = false;
   }
 
-  // Cleanup function
-  function destroyMap(): void {
-    if (map) {
-      map.remove();
-    }
-  }
-
   // Sync map actions with sidebar store
   $effect(() => {
     mapActions.set({
@@ -458,7 +839,7 @@
     ></div>
 
     <!-- Direction & Depth indicators -->
-    <div class="absolute top-3 left-14 z-[1000] flex gap-2">
+    <div class="absolute top-3 left-3 z-[1000] flex gap-2">
       <div class="flex flex-col gap-2">
         <!-- Direction indicator -->
         <div
@@ -759,6 +1140,172 @@
 
     <!-- Collapsible Sidebar with controls -->
     <div class="absolute top-4 right-4 z-[1000] w-56 space-y-2">
+      <!-- Offline map package selector -->
+      <div class="rounded-lg bg-white/80 p-3 shadow-lg backdrop-blur-md">
+        <label class="mb-2 block text-sm font-medium" for="offline-map-package">
+          نقشهٔ آفلاین
+        </label>
+        {#if offlineMapsLoading}
+          <div class="flex items-center gap-2 text-xs text-gray-600">
+            <span class="loading loading-spinner loading-xs"></span>
+            در حال بارگذاری نقشه‌ها...
+          </div>
+        {:else if $offlineMaps.length === 0}
+          <p class="text-xs text-gray-600">
+            بسته‌ای نصب نشده است. ابتدا از تنظیمات یک فایل PMTiles وارد کنید.
+          </p>
+        {:else}
+          <select
+            id="offline-map-package"
+            class="select select-bordered select-sm w-full bg-white text-sm"
+            value={$offlineMap?.info.id ?? ""}
+            onchange={handleOfflineMapSelection}
+            disabled={isActivatingOfflineMap}
+          >
+            <option value="" disabled>انتخاب بستهٔ نقشه</option>
+            {#each $offlineMaps as packageInfo (packageInfo.id)}
+              <option value={packageInfo.id}>{packageInfo.name}</option>
+            {/each}
+          </select>
+          {#if isActivatingOfflineMap}
+            <p class="mt-2 flex items-center gap-2 text-xs text-gray-600" role="status">
+              <span class="loading loading-spinner loading-xs"></span>
+              در حال فعال‌سازی و رفتن به محدوده نقشه...
+            </p>
+          {:else if $offlineMap}
+            <p class="mt-2 text-xs text-gray-600">
+              {$offlineMap.info.tileKind === "vector" ? "نقشهٔ برداری" : "نقشهٔ رستری"} · محدودهٔ فعال
+            </p>
+            <button
+              type="button"
+              class="btn btn-xs btn-outline mt-2 w-full gap-1"
+              onclick={focusOfflineMapCenter}
+              title="رفتن به مرکز بستهٔ نقشه"
+            >
+              <LocateFixed class="h-3.5 w-3.5" />
+              رفتن به مرکز نقشه
+            </button>
+          {/if}
+        {/if}
+        {#if offlineMapActivationError}
+          <p class="mt-2 text-xs text-error" role="alert">{offlineMapActivationError}</p>
+        {/if}
+      </div>
+
+      <!-- Search stays entirely inside the active local vector archive. -->
+      <section class="rounded-lg bg-white/80 p-3 shadow-lg backdrop-blur-md">
+        <label class="mb-2 block text-sm font-medium" for="offline-map-search">
+          جستجو در نقشه
+        </label>
+        <div class="relative">
+          <Search class="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+          <input
+            id="offline-map-search"
+            type="search"
+            class="input input-bordered input-sm w-full bg-white pr-9 text-sm"
+            placeholder="جستجو..."
+            autocomplete="off"
+            dir="auto"
+            value={offlineSearchQuery}
+            oninput={handleOfflineSearchInput}
+            onkeydown={handleOfflineSearchKeydown}
+            disabled={!$offlineMap || $offlineMap.info.tileKind !== "vector"}
+            aria-describedby="offline-map-search-status"
+          />
+        </div>
+
+        <div id="offline-map-search-status" class="mt-2 text-xs text-gray-600">
+          {#if !$offlineMap}
+            <p>برای جستجو، یک بستهٔ نقشهٔ برداری را فعال کنید.</p>
+          {:else if $offlineMap.info.tileKind === "raster"}
+            <p>این بستهٔ رستری نام مکان‌ها را ندارد؛ جستجو در بسته‌های برداری پشتیبانی می‌شود.</p>
+          {:else if offlineSearchState === "loading"}
+            <p class="flex items-center gap-2" role="status">
+              <span class="loading loading-spinner loading-xs"></span>
+              در حال بررسی فهرست ذخیره‌شده...
+            </p>
+          {:else if offlineSearchState === "building"}
+            <div role="status">
+              <div class="flex items-center justify-between gap-2">
+                <span class="flex items-center gap-2">
+                  <span class="loading loading-spinner loading-xs"></span>
+                  فهرست‌سازی در کل بستهٔ فعال...
+                </span>
+                <button type="button" class="btn btn-ghost btn-xs" onclick={cancelOfflineSearchIndex}>
+                  لغو
+                </button>
+              </div>
+              {#if offlineSearchTotal > 0}
+                <progress
+                  class="progress progress-primary mt-1 w-full"
+                  max="100"
+                  value={Math.min(100, (offlineSearchCompleted / offlineSearchTotal) * 100)}
+                ></progress>
+                <p class="mt-1 text-[10px]" dir="ltr">
+                  {Math.min(100, Math.round((offlineSearchCompleted / offlineSearchTotal) * 100))}% ·
+                  {offlineSearchCompleted.toLocaleString("fa-IR")} / {offlineSearchTotal.toLocaleString("fa-IR")} کاشی
+                </p>
+              {/if}
+            </div>
+          {:else if offlineSearchState === "error"}
+            <p class="text-error" role="alert">{offlineSearchError}</p>
+            <button type="button" class="btn btn-outline btn-xs mt-2 w-full" onclick={startOfflineSearchIndex}>
+              تلاش دوباره
+            </button>
+          {:else if offlineSearchState === "ready"}
+            {#if offlineSearchResultSelected}
+              <p>مکان انتخاب‌شده روی نقشه نشان داده شد.</p>
+            {:else if [...normalizeSearchText(offlineSearchQuery)].length >= 2 && offlineSearchResults.length > 0}
+              <ul class="mt-2 max-h-56 space-y-1 overflow-y-auto">
+                {#each offlineSearchResults as result (result.id)}
+                  <li>
+                    <button
+                      type="button"
+                      class="w-full rounded-md p-2 text-right hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+                      onclick={() => focusOfflineSearchResult(result)}
+                    >
+                      <span class="flex items-center gap-2">
+                        <MapPin class="h-3.5 w-3.5 shrink-0 text-success" />
+                        <span class="truncate font-medium" dir="auto">{result.title}</span>
+                      </span>
+                      <span class="mt-1 block truncate text-[10px] text-gray-500">
+                        {searchLayerLabel(result.layer)}{result.detail ? ` · ${result.detail}` : ""}
+                        <span dir="ltr"> · {result.lat.toFixed(4)}, {result.lon.toFixed(4)}</span>
+                      </span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {:else if [...normalizeSearchText(offlineSearchQuery)].length >= 2}
+              <p class="mt-2">نتیجه‌ای برای این عبارت در بسته پیدا نشد.</p>
+            {:else}
+              <p>
+                جستجو بین {offlineSearchIndex?.entries.length.toLocaleString("fa-IR") ?? "۰"} نام در کل بستهٔ فعال.
+              </p>
+            {/if}
+          {:else if offlineSearchState === "idle"}
+            {#if [...normalizeSearchText(offlineSearchQuery)].length >= 2}
+              <p>فهرست‌سازی آغاز نشده یا لغو شده است.</p>
+              <button type="button" class="btn btn-outline btn-xs mt-2 w-full" onclick={startOfflineSearchIndex}>
+                ادامهٔ فهرست‌سازی
+              </button>
+            {:else}
+              <p>
+                با وارد کردن حداقل دو نویسه، نام‌ها از همهٔ کاشی‌های بسته به‌صورت محلی فهرست می‌شوند.
+              </p>
+            {/if}
+          {/if}
+          {#if offlineSearchCacheWarning}
+            <p class="mt-1 text-warning" role="status">{offlineSearchCacheWarning}</p>
+          {/if}
+          {#if offlineSearchUnreadableTiles > 0 && offlineSearchState === "ready"}
+            <p class="mt-1 text-warning" role="status">
+              {offlineSearchUnreadableTiles.toLocaleString("fa-IR")} کاشی قابل خواندن نبود.
+            </p>
+          {/if}
+        </div>
+      </section>
+
       <!-- Status Information Panel -->
       <div
         class="bg-white/30 bg-opacity-60 backdrop-blur-md rounded-lg shadow-lg"
@@ -799,6 +1346,7 @@
         {/if}
       </div>
     </div>
+
     <div class="absolute bottom-2 left-2 right-2 z-[1000] flex flex-col gap-2">
       <!-- Sent Pins Panel -->
       <div
@@ -1015,10 +1563,3 @@
     </div>
   {/if}
 </div>
-
-<style>
-  :global(.leaflet-grab),
-  :global(.leaflet-container) {
-    cursor: default !important;
-  }
-</style>

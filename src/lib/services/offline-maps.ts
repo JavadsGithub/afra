@@ -1,4 +1,5 @@
 import { FileSource, PMTiles, TileType, type Header } from "pmtiles";
+import { deleteOfflineSearchIndex } from "$lib/services/offline-search";
 import { get, writable } from "svelte/store";
 
 const DATABASE_NAME = "afra-offline-maps";
@@ -498,5 +499,12 @@ export async function removeOfflineMap(id: string): Promise<void> {
       offlineMap.set(null);
       loadPromise = Promise.resolve(null);
     }
+  }
+
+  try {
+    await deleteOfflineSearchIndex(id);
+  } catch (error) {
+    // Removing a map should still succeed if its optional search cache cannot be cleared.
+    console.warn("Could not remove the offline search index:", error);
   }
 }

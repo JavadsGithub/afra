@@ -33,7 +33,17 @@
   import { mapActions } from "$lib/stores/map-actions";
   import { settings, isPortConnected, updateMode } from "$lib/stores/settings";
   import { telemetryData, lastTelemetry } from "$lib/stores/telemetry";
-  import { ChevronDown, Copy, LocateFixed, Navigation2 as Navigation } from "lucide-svelte";
+  import {
+    deleteOfflineSearchIndex,
+    loadOfflineSearchIndex,
+    normalizeSearchText,
+    saveOfflineSearchIndex,
+    searchOfflineMapIndex,
+    type OfflineSearchEntry,
+    type OfflineSearchIndex,
+    type OfflineSearchWorkerResponse,
+  } from "$lib/services/offline-search";
+  import { ChevronDown, Copy, LocateFixed, MapPin, Navigation2 as Navigation, Search } from "lucide-svelte";
   import { sendPins } from "$lib/services/transmitter";
   import { connectionStatus } from "$lib/stores/settings";
   import { get } from "svelte/store";
@@ -57,6 +67,22 @@
   let offlineMapsLoading = $state(true);
   let isActivatingOfflineMap = $state(false);
   let offlineMapActivationError = $state("");
+  let offlineSearchQuery = $state("");
+  let offlineSearchResultSelected = $state(false);
+  let offlineSearchResults = $state<OfflineSearchEntry[]>([]);
+  let offlineSearchIndex = $state.raw<OfflineSearchIndex | null>(null);
+  let offlineSearchState = $state<"idle" | "loading" | "building" | "ready" | "error" | "unsupported">("idle");
+  let offlineSearchError = $state("");
+  let offlineSearchCacheWarning = $state("");
+  let offlineSearchCompleted = $state(0);
+  let offlineSearchTotal = $state(0);
+  let offlineSearchUnreadableTiles = $state(0);
+  let offlineSearchWorker: Worker | null = null;
+  let offlineSearchRequestId: string | null = null;
+  let offlineSearchMapId: string | null = null;
+  let offlineSearchGeneration = 0;
+  let offlineSearchRequestSequence = 0;
+  let searchResultMarker: MapLibreMarker | null = null;
   let pinMarkers = new Map<number, MapLibreMarker>();
   let locationMarker: MapLibreMarker | null = null;
   let currentPosition = $state({ lat: 35.6895, lng: 51.389 });
@@ -244,6 +270,233 @@
     }
   }
 
+  function stopOfflineSearchWorker(): void {
+    offlineSearchWorker?.terminate();
+    offlineSearchWorker = null;
+    offlineSearchRequestId = null;
+  }
+
+  function updateOfflineSearchResults(): void {
+    if (offlineSearchResultSelected || !offlineSearchIndex || offlineSearchState !== "ready") {
+      offlineSearchResults = [];
+      return;
+    }
+
+    const normalizedQuery = normalizeSearchText(offlineSearchQuery);
+    if ([...normalizedQuery].length < 2) {
+      offlineSearchResults = [];
+      return;
+    }
+
+    const center = map?.getCenter();
+    const origin: [number, number] = center
+      ? [center.lng, center.lat]
+      : [currentPosition.lng, currentPosition.lat];
+    offlineSearchResults = searchOfflineMapIndex(offlineSearchIndex, offlineSearchQuery, origin, 8);
+  }
+
+  function startOfflineSearchIndex(): void {
+    const packageInfo = get(offlineMap);
+    if (
+      !packageInfo ||
+      packageInfo.info.tileKind !== "vector" ||
+      packageInfo.info.id !== offlineSearchMapId ||
+      offlineSearchWorker ||
+      offlineSearchState === "building"
+    ) {
+      return;
+    }
+
+    offlineSearchState = "building";
+    offlineSearchError = "";
+    offlineSearchCacheWarning = "";
+    offlineSearchCompleted = 0;
+    offlineSearchTotal = packageInfo.header.numAddressedTiles;
+    const requestId = `offline-search-${Date.now()}-${++offlineSearchRequestSequence}`;
+    offlineSearchRequestId = requestId;
+
+    try {
+      const worker = new Worker(
+        new URL("../../workers/offline-map-search.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+      offlineSearchWorker = worker;
+      worker.onmessage = (event: MessageEvent<OfflineSearchWorkerResponse>) => {
+        const message = event.data;
+        if (
+          message.requestId !== offlineSearchRequestId ||
+          packageInfo.info.id !== offlineSearchMapId
+        ) {
+          return;
+        }
+
+        if (message.type === "progress") {
+          offlineSearchCompleted = message.completed;
+          offlineSearchTotal = message.total;
+          return;
+        }
+        if (message.type === "cancelled") {
+          stopOfflineSearchWorker();
+          offlineSearchState = "idle";
+          return;
+        }
+        if (message.type === "error") {
+          stopOfflineSearchWorker();
+          offlineSearchState = "error";
+          offlineSearchError = message.error;
+          return;
+        }
+
+        stopOfflineSearchWorker();
+        offlineSearchIndex = message.index;
+        offlineSearchState = "ready";
+        offlineSearchUnreadableTiles = message.unreadableTiles ?? 0;
+        updateOfflineSearchResults();
+
+        void saveOfflineSearchIndex(packageInfo.info.id, message.index)
+          .then(async () => {
+            if (!get(offlineMaps).some((item) => item.id === packageInfo.info.id)) {
+              await deleteOfflineSearchIndex(packageInfo.info.id);
+            }
+          })
+          .catch((error: unknown) => {
+            if (offlineSearchMapId === packageInfo.info.id) {
+              offlineSearchCacheWarning = error instanceof Error
+                ? "فهرست آماده است، اما ذخیرهٔ ماندگار آن ناموفق بود."
+                : "فهرست آماده است، اما ذخیرهٔ ماندگار آن ممکن نشد.";
+            }
+          });
+      };
+      worker.onerror = (event: ErrorEvent) => {
+        if (offlineSearchRequestId !== requestId) return;
+        stopOfflineSearchWorker();
+        offlineSearchState = "error";
+        offlineSearchError = event.message || "ساخت فهرست جستجو ناموفق بود";
+      };
+      worker.postMessage({ type: "build", requestId, file: packageInfo.file });
+    } catch (error) {
+      stopOfflineSearchWorker();
+      offlineSearchState = "error";
+      offlineSearchError = error instanceof Error
+        ? error.message
+        : "ساخت فهرست جستجو ناموفق بود";
+    }
+  }
+
+  function cancelOfflineSearchIndex(): void {
+    if (offlineSearchWorker && offlineSearchRequestId) {
+      offlineSearchWorker.postMessage({ type: "cancel", requestId: offlineSearchRequestId });
+    }
+    stopOfflineSearchWorker();
+    offlineSearchState = "idle";
+    offlineSearchCompleted = 0;
+    offlineSearchResults = [];
+  }
+
+  function handleOfflineSearchInput(event: Event): void {
+    offlineSearchQuery = (event.currentTarget as HTMLInputElement).value;
+    offlineSearchResultSelected = false;
+    offlineSearchResults = [];
+    if ([...normalizeSearchText(offlineSearchQuery)].length < 2) return;
+
+    if (offlineSearchState === "ready") updateOfflineSearchResults();
+    else if (offlineSearchState === "idle" || offlineSearchState === "error") {
+      startOfflineSearchIndex();
+    }
+  }
+
+  function handleOfflineSearchKeydown(event: KeyboardEvent): void {
+    if (event.key === "Enter" && offlineSearchResults.length > 0) {
+      event.preventDefault();
+      focusOfflineSearchResult(offlineSearchResults[0]);
+    }
+  }
+
+  function focusOfflineSearchResult(entry: OfflineSearchEntry): void {
+    if (!map) return;
+    currentPosition = { lat: entry.lat, lng: entry.lon };
+    searchResultMarker?.remove();
+    searchResultMarker = new MapLibreMarkerClass({ color: "#16a34a" })
+      .setLngLat([entry.lon, entry.lat])
+      .addTo(map);
+
+    const archiveMaxZoom = offlineSearchIndex?.maxZoom ?? 15;
+    map.easeTo({
+      center: [entry.lon, entry.lat],
+      zoom: Math.min(Math.max(map.getZoom(), 13), archiveMaxZoom),
+      duration: 650,
+    });
+    offlineSearchQuery = entry.title;
+    offlineSearchResultSelected = true;
+    offlineSearchResults = [];
+  }
+
+  function searchLayerLabel(layer: OfflineSearchEntry["layer"]): string {
+    switch (layer) {
+      case "earth": return "منطقه";
+      case "landcover": return "پوشش زمین";
+      case "landuse": return "کاربری زمین";
+      case "places": return "مکان";
+      case "pois": return "نقطهٔ موردعلاقه";
+      case "roads": return "راه";
+      case "water": return "آبراه یا پهنهٔ آبی";
+      case "buildings": return "ساختمان";
+      case "boundaries": return "مرز";
+      default: return layer.replace(/[_-]/g, " ");
+    }
+  }
+
+  function handleOfflineMapChange(packageInfo: OfflineMapPackage | null): void {
+    syncOfflineMap(packageInfo);
+    const mapId = packageInfo?.info.id ?? null;
+    if (mapId === offlineSearchMapId) return;
+
+    offlineSearchMapId = mapId;
+    const generation = ++offlineSearchGeneration;
+    stopOfflineSearchWorker();
+    offlineSearchIndex = null;
+    offlineSearchResultSelected = false;
+    offlineSearchResults = [];
+    offlineSearchError = "";
+    offlineSearchCacheWarning = "";
+    offlineSearchCompleted = 0;
+    offlineSearchTotal = 0;
+    offlineSearchUnreadableTiles = 0;
+    searchResultMarker?.remove();
+    searchResultMarker = null;
+
+    if (!packageInfo) {
+      offlineSearchState = "idle";
+      return;
+    }
+    if (packageInfo.info.tileKind !== "vector") {
+      offlineSearchState = "unsupported";
+      return;
+    }
+
+    const activeMapId = packageInfo.info.id;
+    offlineSearchState = "loading";
+    void loadOfflineSearchIndex(activeMapId).then((index) => {
+      if (generation !== offlineSearchGeneration || offlineSearchMapId !== activeMapId) return;
+      if (index) {
+        offlineSearchIndex = index;
+        offlineSearchState = "ready";
+        updateOfflineSearchResults();
+        return;
+      }
+      offlineSearchState = "idle";
+      if ([...normalizeSearchText(offlineSearchQuery)].length >= 2) {
+        startOfflineSearchIndex();
+      }
+    }).catch((error: unknown) => {
+      if (generation !== offlineSearchGeneration || offlineSearchMapId !== activeMapId) return;
+      offlineSearchState = "error";
+      offlineSearchError = error instanceof Error
+        ? error.message
+        : "فهرست جستجوی محلی بارگذاری نشد";
+    });
+  }
+
   function updateMarkersOnMap(): void {
     if (!map) return;
     for (const marker of pinMarkers.values()) marker.remove();
@@ -312,6 +565,7 @@
     mapInstance.on("moveend", () => {
       const center = mapInstance.getCenter();
       coordinates = `${center.lat.toFixed(6)}, ${center.lng.toFixed(6)}`;
+      updateOfflineSearchResults();
     });
 
     const handleOutsideClick = (event: Event) => {
@@ -321,7 +575,7 @@
     };
     document.addEventListener("click", handleOutsideClick);
 
-    unsubscribeOfflineMap = offlineMap.subscribe(syncOfflineMap);
+    unsubscribeOfflineMap = offlineMap.subscribe(handleOfflineMapChange);
     void loadSavedOfflineMaps()
       .catch((error) => {
         // There is deliberately no network fallback if local map data is unavailable.
@@ -352,6 +606,10 @@
 
     return () => {
       isDisposed = true;
+      offlineSearchGeneration++;
+      stopOfflineSearchWorker();
+      searchResultMarker?.remove();
+      searchResultMarker = null;
       unsubscribeOfflineMap?.();
       unsubscribeOfflineMap = null;
       document.removeEventListener("click", handleOutsideClick);
@@ -933,6 +1191,120 @@
           <p class="mt-2 text-xs text-error" role="alert">{offlineMapActivationError}</p>
         {/if}
       </div>
+
+      <!-- Search stays entirely inside the active local vector archive. -->
+      <section class="rounded-lg bg-white/80 p-3 shadow-lg backdrop-blur-md">
+        <label class="mb-2 block text-sm font-medium" for="offline-map-search">
+          جستجو در نقشه
+        </label>
+        <div class="relative">
+          <Search class="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+          <input
+            id="offline-map-search"
+            type="search"
+            class="input input-bordered input-sm w-full bg-white pr-9 text-sm"
+            placeholder="نام مکان، خیابان یا عارضه..."
+            autocomplete="off"
+            dir="auto"
+            value={offlineSearchQuery}
+            oninput={handleOfflineSearchInput}
+            onkeydown={handleOfflineSearchKeydown}
+            disabled={!$offlineMap || $offlineMap.info.tileKind !== "vector"}
+            aria-describedby="offline-map-search-status"
+          />
+        </div>
+
+        <div id="offline-map-search-status" class="mt-2 text-xs text-gray-600">
+          {#if !$offlineMap}
+            <p>برای جستجو، یک بستهٔ نقشهٔ برداری را فعال کنید.</p>
+          {:else if $offlineMap.info.tileKind === "raster"}
+            <p>این بستهٔ رستری نام مکان‌ها را ندارد؛ جستجو در بسته‌های برداری پشتیبانی می‌شود.</p>
+          {:else if offlineSearchState === "loading"}
+            <p class="flex items-center gap-2" role="status">
+              <span class="loading loading-spinner loading-xs"></span>
+              در حال بررسی فهرست ذخیره‌شده...
+            </p>
+          {:else if offlineSearchState === "building"}
+            <div role="status">
+              <div class="flex items-center justify-between gap-2">
+                <span class="flex items-center gap-2">
+                  <span class="loading loading-spinner loading-xs"></span>
+                  فهرست‌سازی در کل بستهٔ فعال...
+                </span>
+                <button type="button" class="btn btn-ghost btn-xs" onclick={cancelOfflineSearchIndex}>
+                  لغو
+                </button>
+              </div>
+              {#if offlineSearchTotal > 0}
+                <progress
+                  class="progress progress-primary mt-1 w-full"
+                  max="100"
+                  value={Math.min(100, (offlineSearchCompleted / offlineSearchTotal) * 100)}
+                ></progress>
+                <p class="mt-1 text-[10px]" dir="ltr">
+                  {Math.min(100, Math.round((offlineSearchCompleted / offlineSearchTotal) * 100))}% ·
+                  {offlineSearchCompleted.toLocaleString("fa-IR")} / {offlineSearchTotal.toLocaleString("fa-IR")} کاشی
+                </p>
+              {/if}
+            </div>
+          {:else if offlineSearchState === "error"}
+            <p class="text-error" role="alert">{offlineSearchError}</p>
+            <button type="button" class="btn btn-outline btn-xs mt-2 w-full" onclick={startOfflineSearchIndex}>
+              تلاش دوباره
+            </button>
+          {:else if offlineSearchState === "ready"}
+            {#if offlineSearchResultSelected}
+              <p>مکان انتخاب‌شده روی نقشه نشان داده شد.</p>
+            {:else if [...normalizeSearchText(offlineSearchQuery)].length >= 2 && offlineSearchResults.length > 0}
+              <ul class="mt-2 max-h-56 space-y-1 overflow-y-auto">
+                {#each offlineSearchResults as result (result.id)}
+                  <li>
+                    <button
+                      type="button"
+                      class="w-full rounded-md p-2 text-right hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+                      onclick={() => focusOfflineSearchResult(result)}
+                    >
+                      <span class="flex items-center gap-2">
+                        <MapPin class="h-3.5 w-3.5 shrink-0 text-success" />
+                        <span class="truncate font-medium" dir="auto">{result.title}</span>
+                      </span>
+                      <span class="mt-1 block truncate text-[10px] text-gray-500">
+                        {searchLayerLabel(result.layer)}{result.detail ? ` · ${result.detail}` : ""}
+                        <span dir="ltr"> · {result.lat.toFixed(4)}, {result.lon.toFixed(4)}</span>
+                      </span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {:else if [...normalizeSearchText(offlineSearchQuery)].length >= 2}
+              <p class="mt-2">نتیجه‌ای برای این عبارت در بسته پیدا نشد.</p>
+            {:else}
+              <p>
+                جستجو بین {offlineSearchIndex?.entries.length.toLocaleString("fa-IR") ?? "۰"} نام در کل بستهٔ فعال.
+              </p>
+            {/if}
+          {:else if offlineSearchState === "idle"}
+            {#if [...normalizeSearchText(offlineSearchQuery)].length >= 2}
+              <p>فهرست‌سازی آغاز نشده یا لغو شده است.</p>
+              <button type="button" class="btn btn-outline btn-xs mt-2 w-full" onclick={startOfflineSearchIndex}>
+                ادامهٔ فهرست‌سازی
+              </button>
+            {:else}
+              <p>
+                با وارد کردن حداقل دو نویسه، نام‌ها از همهٔ کاشی‌های بسته به‌صورت محلی فهرست می‌شوند.
+              </p>
+            {/if}
+          {/if}
+          {#if offlineSearchCacheWarning}
+            <p class="mt-1 text-warning" role="status">{offlineSearchCacheWarning}</p>
+          {/if}
+          {#if offlineSearchUnreadableTiles > 0 && offlineSearchState === "ready"}
+            <p class="mt-1 text-warning" role="status">
+              {offlineSearchUnreadableTiles.toLocaleString("fa-IR")} کاشی قابل خواندن نبود.
+            </p>
+          {/if}
+        </div>
+      </section>
 
       <!-- Status Information Panel -->
       <div

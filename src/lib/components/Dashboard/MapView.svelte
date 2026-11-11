@@ -1203,7 +1203,7 @@
             id="offline-map-search"
             type="search"
             class="input input-bordered input-sm w-full bg-white pr-9 text-sm"
-            placeholder="نام مکان، خیابان یا عارضه..."
+            placeholder="جستجو..."
             autocomplete="off"
             dir="auto"
             value={offlineSearchQuery}
